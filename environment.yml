@@ -1,13 +1,43 @@
 name: topology_venv
 channels:
   - conda-forge
-  - defaults
 dependencies:
   - python=3.10
+  - pip
+
+  # Core numerical / analysis
   - numpy
   - pandas
-  - matplotlib
   - scipy
-  - scikit-learn
-  - scikit-image
+  - matplotlib
   - seaborn
+  - scikit-learn
+
+  # Build tooling often needed for pip packages w/ native extensions
+  - cmake
+  - ninja
+  - pkg-config
+
+  # Networking / dev quality-of-life (optional but useful)
+  - ipykernel
+
+  # Install PyPI deps via pip so versions match what you expect
+  - pip:
+      # Web/API
+      - fastapi==0.119.0
+      - uvicorn[standard]>=0.27
+
+      # Serialization / hashing / system info
+      - msgspec>=0.19.0
+      - blake3>=1.0.4
+      - py-cpuinfo>=9.0.0
+
+      # LLM tooling (CPU / mac friendly)
+      - transformers==4.57.1
+      - einops
+      - openai>=2.3.0
+      - tiktoken
+
+      # Torch on macOS (CPU + MPS). Let pip choose the right wheel.
+      # If you want to pin: replace with torch==<version> once you confirm.
+      - torch
