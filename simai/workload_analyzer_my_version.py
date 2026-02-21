@@ -63,7 +63,7 @@ class WorkloadAnalyzer:
             elif part == "all_gpus:" and i + 1 < len(parts):
                 self.config['total_gpus'] = int(parts[i + 1])
             elif part == "pp_comm:" and i + 1 < len(parts):
-                self.config['pp_comm_size'] = int(parts[i + 1])
+                self.config['pp_comm_size'] = int(float(parts[i + 1]))
         
         
         # Calculate derived parameters
