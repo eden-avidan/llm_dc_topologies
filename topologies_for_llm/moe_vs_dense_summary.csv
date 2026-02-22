@@ -1,0 +1,37 @@
+Method,World_Size,Topology,MOE_Mean,Dense_Mean,Difference_%
+TP,512,fat tree,61.77,61.59,0.29
+TP,512,DragonFly+,61.77,61.59,0.29
+TP,512,HyperX,30.88,30.79,0.29
+TP,1024,fat tree,139.34,127.53,9.27
+TP,1024,DragonFly+,139.34,127.53,9.27
+TP,1024,HyperX,69.67,63.76,9.27
+TP,2048,fat tree,318.91,253.98,25.57
+TP,2048,DragonFly+,318.91,253.98,25.57
+TP,2048,HyperX,159.46,126.99,25.57
+DP,512,fat tree,1.00,0.50,100.39
+DP,512,DragonFly+,1.50,0.75,100.39
+DP,512,HyperX,0.59,0.30,98.32
+DP,1024,fat tree,1.69,1.07,58.96
+DP,1024,DragonFly+,2.54,1.60,58.96
+DP,1024,HyperX,0.94,0.60,57.99
+DP,2048,fat tree,3.79,2.14,77.33
+DP,2048,DragonFly+,5.68,3.20,77.33
+DP,2048,HyperX,2.05,1.16,77.11
+PP,512,fat tree,0.00,0.00,-58.36
+PP,512,DragonFly+,0.00,0.01,-58.36
+PP,512,HyperX,0.00,0.00,-56.74
+PP,1024,fat tree,0.00,0.01,-59.36
+PP,1024,DragonFly+,0.00,0.01,-59.36
+PP,1024,HyperX,0.00,0.01,-58.88
+PP,2048,fat tree,0.01,0.01,-62.21
+PP,2048,DragonFly+,0.01,0.02,-62.21
+PP,2048,HyperX,0.01,0.01,-62.02
+Total,512,fat tree,125.54,124.19,1.09
+Total,512,DragonFly+,126.54,124.69,1.48
+Total,512,HyperX,62.94,62.19,1.21
+Total,1024,fat tree,282.07,257.21,9.67
+Total,1024,DragonFly+,283.77,258.29,9.87
+Total,1024,HyperX,141.23,128.75,9.70
+Total,2048,fat tree,645.41,512.30,25.98
+Total,2048,DragonFly+,649.21,514.46,26.19
+Total,2048,HyperX,323.02,256.36,26.01
