@@ -4,6 +4,8 @@ from collections import defaultdict
 import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+import math
 
 
 def assign_od_to_edges_shortest_first(G: nx.DiGraph, OD_csr, weight="weight"):
@@ -37,17 +39,27 @@ def assign_od_to_edges_shortest_first(G: nx.DiGraph, OD_csr, weight="weight"):
     return edge_load
 
 
-def annotate_graph_with_loads(G: nx.DiGraph, edge_load: dict):
+
+def annotate_graph_with_loads(G, edge_load, *, capacity=None):
     """
-    Writes load/util/overloaded back into edge attributes.
+    capacity=None means "infinite" (no overload by util). We store:
+      - load
+      - util (None if capacity is None)
+      - overloaded (always False if capacity is None)
     """
     for u, v, data in G.edges(data=True):
         load = float(edge_load.get((u, v), 0.0))
-        cap = float(data.get("capacity", 1.0))
-        util = load / cap if cap > 0 else 0.0
         data["load"] = load
-        data["util"] = util
-        data["overloaded"] = util > 1.0
+
+        if capacity is None:
+            data["util"] = None
+            data["overloaded"] = False
+            data["capacity"] = math.inf
+        else:
+            cap = float(capacity)
+            data["capacity"] = cap
+            data["util"] = load / cap if cap > 0 else 0.0
+            data["overloaded"] = data["util"] > 1.0
 
 
 def draw_fattree_overload(G: nx.DiGraph, *, max_edges_to_draw=None, title="FatTree edge utilization"):
@@ -78,4 +90,77 @@ def draw_fattree_overload(G: nx.DiGraph, *, max_edges_to_draw=None, title="FatTr
     nx.draw_networkx_edges(G, pos, edgelist=edges, width=widths, edge_color=colors, arrows=False)
     plt.title(title)
     plt.axis("off")
+    plt.show()
+
+def draw_fattree_load_heat(
+    G: nx.DiGraph,
+    *,
+    max_edges_to_draw: int = 3000,
+    title: str = "FatTree edge load (heat)",
+    cmap: str = "inferno",
+    use_log_norm: bool = True,
+    min_positive: float = 1e-12,
+):
+    all_edges = list(G.edges())
+    all_loads = np.array([G[u][v].get("load", 0.0) for u, v in all_edges], dtype=float)
+
+    if not all_edges:
+        print("Graph has no edges to draw.")
+        return
+
+    # Keep only top-K loaded edges
+    if max_edges_to_draw is not None and len(all_edges) > max_edges_to_draw:
+        idx = np.argsort(all_loads)[::-1][:max_edges_to_draw]
+        edges = [all_edges[i] for i in idx]
+        loads = all_loads[idx]
+    else:
+        edges = all_edges
+        loads = all_loads
+
+    max_load = float(np.max(loads)) if loads.size else 1.0
+    if max_load <= 0:
+        max_load = 1.0
+
+    # Normalization
+    if use_log_norm:
+        positive = loads[loads > 0]
+        vmin = float(np.min(positive)) if positive.size else min_positive
+        vmin = max(vmin, min_positive)
+        norm = mpl.colors.LogNorm(vmin=vmin, vmax=max_load)
+    else:
+        norm = mpl.colors.Normalize(vmin=0.0, vmax=max_load)
+
+    cm = mpl.cm.get_cmap(cmap)
+
+    # Colors + widths
+    edge_colors = [cm(norm(max(l, min_positive if use_log_norm else 0.0))) for l in loads]
+    if use_log_norm:
+        wscale = np.array([norm(max(l, min_positive)) for l in loads], dtype=float)
+    else:
+        wscale = np.array([l / max_load for l in loads], dtype=float)
+    edge_widths = (1.0 + 5.0 * wscale).tolist()
+
+    pos = nx.spring_layout(G, seed=0, k=0.25)
+
+    # ✅ Explicit fig/ax so colorbar knows where to go
+    fig, ax = plt.subplots(figsize=(14, 10))
+    nx.draw_networkx_nodes(G, pos, node_size=30, ax=ax)
+    nx.draw_networkx_edges(
+        G, pos,
+        edgelist=edges,
+        width=edge_widths,
+        edge_color=edge_colors,
+        arrows=False,
+        alpha=0.95,
+        ax=ax,
+    )
+
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cm)
+    sm.set_array([])
+
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.02)
+    cbar.set_label("Edge load (bytes in matrix window)" + (" [log scale]" if use_log_norm else ""))
+
+    ax.set_title(f"{title} (max load {float(np.max(loads)):.3e})")
+    ax.set_axis_off()
     plt.show()
