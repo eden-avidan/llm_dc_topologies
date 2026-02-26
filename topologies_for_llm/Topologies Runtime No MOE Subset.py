@@ -13,10 +13,11 @@ import numpy as np
 import os
 import re
 import matplotlib.pyplot as plt
+from output_config import get_variant_paths, METADATA_DIR
 
 # Load the list of files to process
 script_dir = Path(__file__).resolve().parent
-files_to_process_file = script_dir / "non_moe_files_to_process.txt"
+files_to_process_file = METADATA_DIR / "non_moe_files_to_process.txt"
 
 if not files_to_process_file.exists():
     print("❌ File list not found. Run 'process_matching_no_moe.py' first!")
@@ -29,6 +30,7 @@ print(f"📋 Loaded {len(files_to_process)} files to process")
 
 # Configuration
 output_suffix = "_no_moe"
+paths = get_variant_paths("no_moe")
 
 # Gather data from the SimAI simulations:
 invalid_dirs = ["workload", "heatmaps", "workload_moe"]
@@ -240,7 +242,7 @@ for df in dfs_list[1:]:
 Runtime_dfs["Total"] = total_runtime_df
 
 # Save DataFrames
-save_dir = f"saved DataFrames{output_suffix}"
+save_dir = str(paths["dataframes"])
 os.makedirs(save_dir, exist_ok=True)
 
 print(f"\n💾 Saving DataFrames to: {save_dir}/")
@@ -249,7 +251,7 @@ for name, df in Runtime_dfs.items():
     print(f"   Saved: {name}.pkl ({len(df)} workloads)")
 
 # Generate plots
-plots_dir = f"plots - overhead communication{output_suffix}"
+plots_dir = str(paths["plots_overhead"])
 os.makedirs(plots_dir, exist_ok=True)
 
 print(f"\n📊 Generating plots in: {plots_dir}/")

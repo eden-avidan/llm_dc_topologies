@@ -8,10 +8,12 @@ import pandas as pd
 import re
 import numpy as np
 import os
+from output_config import get_variant_paths
 
 #%% Configuration
 
-PKL_DIR = "saved DataFrames_no_moe"
+paths = get_variant_paths("no_moe")
+PKL_DIR = str(paths["dataframes"])
 output_suffix = "_no_moe"
 
 print("📊 Processing Non-MOE Subset: Matching MOE configurations")
@@ -33,7 +35,7 @@ TOPOLOGY_COLS = ["fat tree", "DragonFly+", "HyperX"]
 NUM_BINS = 10
 
 # Create output directory structure
-OUTPUT_DIR = f"simulation_plots{output_suffix}"
+OUTPUT_DIR = str(paths["plots_simulation"])
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 print(f"📊 Saving plots to: {OUTPUT_DIR}")
 

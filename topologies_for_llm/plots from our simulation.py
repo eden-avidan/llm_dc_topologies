@@ -10,6 +10,7 @@ import re
 import numpy as np
 import os
 import argparse
+from output_config import get_variant_paths
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Generate plots from SimAI simulation results')
@@ -20,13 +21,14 @@ args = parser.parse_args()
 #%% Configuration
 
 # Path to pkl files (depends on MOE flag)
+variant = "moe" if args.moe_active else "standard"
+paths = get_variant_paths(variant)
+PKL_DIR = str(paths["dataframes"])
+output_suffix = "_moe" if args.moe_active else ""
+
 if args.moe_active:
-    PKL_DIR = "saved DataFrames_moe"
-    output_suffix = "_moe"
     print("🔬 MOE Mode: Using MOE-enabled simulation data")
 else:
-    PKL_DIR = "saved DataFrames"
-    output_suffix = ""
     print("📊 Standard Mode: Using regular simulation data")
 
 # Check if directory exists
@@ -50,7 +52,7 @@ TOPOLOGY_COLS = ["fat tree", "DragonFly+", "HyperX"]
 NUM_BINS = 10
 
 # Create output directory structure
-OUTPUT_DIR = f"simulation_plots{output_suffix}"
+OUTPUT_DIR = str(paths["plots_simulation"])
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 print(f"📊 Saving plots to: {OUTPUT_DIR}")
 

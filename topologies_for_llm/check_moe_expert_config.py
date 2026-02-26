@@ -19,7 +19,7 @@ def analyze_moe_config(filename):
     match_model = re.search(r'(gpt_\d+B|llama_\d+B)', filename)
 
     if not all([match_ws, match_tp, match_pp, match_ep, match_model]):
-        print(f"❌ Could not parse configuration from filename: {filename}")
+        print(f"Error: Could not parse configuration from filename: {filename}")
         return
 
     world_size = int(match_ws.group(1))

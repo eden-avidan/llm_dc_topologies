@@ -13,6 +13,7 @@ import os
 import re
 import matplotlib.pyplot as plt
 import argparse
+from output_config import get_variant_paths
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Analyze topology runtime for SimAI workloads')
@@ -307,7 +308,9 @@ else:
 
 #%% save the DataFrames
 
-save_dir = f"saved DataFrames{output_suffix}"
+variant = "moe" if args.moe_active else "standard"
+paths = get_variant_paths(variant)
+save_dir = str(paths["dataframes"])
 os.makedirs(save_dir, exist_ok=True)
 
 print(f"\n💾 Saving DataFrames to: {save_dir}/")
@@ -349,7 +352,7 @@ for filename in os.listdir(save_dir):
 # ax.set_xticks(x_axis_loc)
 # ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
 
-plots_dir = f"plots - overhead communication{output_suffix}"
+plots_dir = str(paths["plots_overhead"])
 os.makedirs(plots_dir, exist_ok=True)
 
 print(f"\n📊 Generating plots in: {plots_dir}/")
@@ -422,7 +425,7 @@ import os
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
 # נוודא שתיקיית הפלט קיימת
-output_dir = f"heatmaps{output_suffix}"
+output_dir = str(paths["heatmaps"])
 os.makedirs(output_dir, exist_ok=True)
 print(f"\n🗺️  Generating heatmaps in: {output_dir}/")
 

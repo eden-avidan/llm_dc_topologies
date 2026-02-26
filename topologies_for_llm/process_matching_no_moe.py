@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 from dataclasses import dataclass
 import numpy as np
+from output_config import METADATA_DIR, get_variant_paths
 
 # Import from Topologies Runtime.py
 script_dir = Path(__file__).resolve().parent
@@ -109,7 +110,8 @@ print(f"\n✅ Found {len(matching_configs)} matching non-MOE configurations")
 print(f"   (out of {len(moe_files)} MOE workloads)")
 
 # Save the mapping
-mapping_file = script_dir / "moe_to_non_moe_mapping.txt"
+os.makedirs(METADATA_DIR, exist_ok=True)
+mapping_file = METADATA_DIR / "moe_to_non_moe_mapping.txt"
 with open(mapping_file, 'w') as f:
     f.write("MOE File -> Non-MOE File\n")
     f.write("="*100 + "\n")
@@ -123,7 +125,7 @@ print(f"\n📄 Mapping saved to: {mapping_file}")
 non_moe_files_to_process = [m["non_moe_file"] for m in matching_configs]
 
 print(f"\n💾 Creating list of files to process...")
-list_file = script_dir / "non_moe_files_to_process.txt"
+list_file = METADATA_DIR / "non_moe_files_to_process.txt"
 with open(list_file, 'w') as f:
     for filename in non_moe_files_to_process:
         f.write(filename + "\n")
@@ -136,6 +138,7 @@ print("="*70)
 print("Run the modified Topologies Runtime script to process only these files:")
 print(f"  python3 'Topologies Runtime No MOE Subset.py'")
 print("\nThis will generate:")
-print(f"  - saved DataFrames{output_suffix}/")
-print(f"  - plots - overhead communication{output_suffix}/")
-print(f"  - heatmaps{output_suffix}/")
+paths = get_variant_paths("no_moe")
+print(f"  - {paths['dataframes']}/")
+print(f"  - {paths['plots_overhead']}/")
+print(f"  - {paths['heatmaps']}/")
