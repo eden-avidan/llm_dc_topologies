@@ -5,8 +5,16 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import os
 
-from assign_and_plot import assign_od_to_edges_shortest_first, annotate_graph_with_loads, draw_fattree_load_heat, draw_fattree_overload
+from assign_and_plot import (
+    annotate_graph_with_loads,
+    assign_od_to_edges_shortest_first,
+    draw_fattree_load_heat,
+    draw_fattree_overload,
+    plot_edge_load_cdf,
+)
+from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
+from topologies.hyperx import HyperX
 matrices_moe = '/Users/eavidan/Documents/topology_repo/simai/final_output/matrices_moe'
 matrices = '/Users/eavidan/Documents/topology_repo/simai/final_output/matrices'
 
@@ -86,41 +94,94 @@ def load_workloads_from_dir(matrices_dir: Path, pattern: str = "*.csv", dtype=np
         workloads[name] = load_csv_to_csr(csv_path, dtype=dtype)
     print(f"Total {len(workloads)} workloads from {matrices_dir}")
     return workloads
-
+    
 def run_one_workload_on_fattree(workloads: dict, workload_name: str, *, switch_ports=64, down_ports=None):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
-    # Build topology for that world size
     ft = FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports, link_capacity=1.0, link_weight=1.0)
-
-    # Convert to NetworkX
     G = ft.convert_to_networkx()
 
     edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
-    annotate_graph_with_loads(G, edge_load)   # must set edge attribute "load"
 
-    draw_fattree_load_heat(
-        G,
-        max_edges_to_draw=3000,
-        use_log_norm=True,
-        title=f"FatTree load heat - {workload_name}"
-    )
-
-    # Summaries
-    utils = [data.get("util", 0.0) for _, _, data in G.edges(data=True)]
-    max_util = max(utils) if utils else 0.0
-    overloaded = sum(1 for u, v, d in G.edges(data=True) if d.get("overloaded", False))
+    # Infinite capacity => util is irrelevant; just store load
+    annotate_graph_with_loads(G, edge_load, capacity=None)
 
     print(f"\nWorkload: {workload_name}")
     print(f"Endpoints (GPUs): {n}")
     print(f"Graph nodes (incl switches): {G.number_of_nodes()}")
     print(f"Graph edges (directed): {G.number_of_edges()}")
-    print(f"Max utilization: {max_util:.3f}")
-    print(f"Overloaded edges: {overloaded}")
 
-    # Draw (for large n, draw only top busy edges)
-    draw_fattree_overload(G, max_edges_to_draw=3000, title=f"FatTree overload - {workload_name} (max util {max_util:.2f})")
+    plot_edge_load_cdf(
+        G,
+        title=f"FatTree edge-load CDF - {workload_name}",
+        use_log_x=True,
+        include_zeros=True,
+    )
+
+
+def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_ports=64, endpoints_per_router=8):
+    OD = workloads[workload_name]
+    n = OD.shape[0]
+
+    hx = HyperX(
+        num_nodes=n,
+        router_ports=router_ports,
+        endpoints_per_router=endpoints_per_router,
+        link_capacity=1.0,
+        link_weight=1.0,
+    )
+    G = hx.convert_to_networkx()
+
+    edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
+
+    # Infinite capacity => util is irrelevant; just store load
+    annotate_graph_with_loads(G, edge_load, capacity=None)
+
+    print(f"\nWorkload: {workload_name}")
+    print(f"Endpoints (GPUs): {n}")
+    print(f"Graph nodes (incl switches): {G.number_of_nodes()}")
+    print(f"Graph edges (directed): {G.number_of_edges()}")
+
+    plot_edge_load_cdf(
+        G,
+        title=f"HyperX edge-load CDF - {workload_name}",
+        use_log_x=True,
+        include_zeros=True,
+    )
+
+
+def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, router_ports=64, endpoints_per_router=8, global_links_per_router=8):
+    OD = workloads[workload_name]
+    n = OD.shape[0]
+
+    dfp = DragonflyPlus(
+        num_nodes=n,
+        router_ports=router_ports,
+        endpoints_per_router=endpoints_per_router,
+        global_links_per_router=global_links_per_router,
+        link_capacity=1.0,
+        link_weight=1.0,
+    )
+    G = dfp.convert_to_networkx()
+
+    edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
+
+    # Infinite capacity => util is irrelevant; just store load
+    annotate_graph_with_loads(G, edge_load, capacity=None)
+
+    print(f"\nWorkload: {workload_name}")
+    print(f"Endpoints (GPUs): {n}")
+    print(f"Graph nodes (incl switches): {G.number_of_nodes()}")
+    print(f"Graph edges (directed): {G.number_of_edges()}")
+
+    plot_edge_load_cdf(
+        G,
+        title=f"DragonflyPlus edge-load CDF - {workload_name}",
+        use_log_x=True,
+        include_zeros=True,
+    )
+
 
 def main() -> None:
     matrices_dirs = [matrices_moe, matrices]
@@ -142,6 +203,8 @@ def main() -> None:
 
         chosen = next(iter(workloads.keys()))
         run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
+        run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
+        run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
 
 
 if __name__ == "__main__":

@@ -164,3 +164,41 @@ def draw_fattree_load_heat(
     ax.set_title(f"{title} (max load {float(np.max(loads)):.3e})")
     ax.set_axis_off()
     plt.show()
+
+def plot_edge_load_cdf(
+    G,
+    *,
+    title: str = "Edge-load CDF",
+    use_log_x: bool = True,
+    include_zeros: bool = True,
+):
+    """
+    Plots: percent of edges with load <= x  (empirical CDF)
+
+    Requires each edge to have attribute 'load' (float).
+    """
+    loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+
+    if not include_zeros:
+        loads = loads[loads > 0]
+
+    if loads.size == 0:
+        print("No loads to plot (empty or all zero).")
+        return
+
+    loads.sort()
+    y = (np.arange(1, loads.size + 1) / loads.size) * 100.0  # percent
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(loads, y)
+    plt.ylabel("Edges with load ≤ x (%)")
+    plt.xlabel("Edge load (bytes in matrix window)")
+    plt.title(title)
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+
+    if use_log_x:
+        # log scale helps when loads span orders of magnitude
+        plt.xscale("log")
+
+    plt.ylim(0, 105)
+    plt.show()
