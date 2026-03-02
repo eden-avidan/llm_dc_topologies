@@ -11,10 +11,12 @@ from assign_and_plot import (
     draw_fattree_load_heat,
     draw_fattree_overload,
     plot_edge_load_cdf,
+    plot_edge_load_cdf_multiple
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
 from topologies.hyperx import HyperX
+
 matrices_moe = '/Users/eavidan/Documents/topology_repo/simai/final_output/matrices_moe'
 matrices = '/Users/eavidan/Documents/topology_repo/simai/final_output/matrices'
 
@@ -182,6 +184,20 @@ def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, r
         include_zeros=True,
     )
 
+def create_all_topologies_and_graphs(workloads: dict, workload_name: str, switch_ports: int = 64, down_ports: int = None, router_ports: int = 64, endpoints_per_router: int = 8, global_links_per_router: int = 8):
+    graphs = {}
+    OD = workloads[workload_name]
+    n = OD.shape[0]
+
+    graphs["Fat Tree"] = FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports, link_capacity=1.0, link_weight=1.0).convert_to_networkx()
+    graphs["HyperX"] = HyperX(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router, link_capacity=1.0, link_weight=1.0).convert_to_networkx()
+    graphs["Dragonfly+"] = DragonflyPlus(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router, global_links_per_router=global_links_per_router, link_capacity=1.0, link_weight=1.0).convert_to_networkx()
+    
+    for G in graphs.values():
+        edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
+        annotate_graph_with_loads(G, edge_load, capacity=None)
+    
+    plot_edge_load_cdf_multiple(graphs, title=f"Edge-load CDF - {workload_name}", use_log_x=True, include_zeros=True)
 
 def main() -> None:
     matrices_dirs = [matrices_moe, matrices]
@@ -202,10 +218,10 @@ def main() -> None:
             print(f"... ({len(workloads)-5} more)")
 
         chosen = next(iter(workloads.keys()))
-        run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
-        run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
-        run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
+        # run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
+        # run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
+        # run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
 
-
+        create_all_topologies_and_graphs(workloads, chosen, switch_ports=64, down_ports=None, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
 if __name__ == "__main__":
     main()

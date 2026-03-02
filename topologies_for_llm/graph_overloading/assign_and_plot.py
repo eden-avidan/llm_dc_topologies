@@ -202,3 +202,58 @@ def plot_edge_load_cdf(
 
     plt.ylim(0, 105)
     plt.show()
+
+
+def plot_edge_load_cdf_multiple(
+    graphs_dict,
+    *,
+    title: str = "Edge-load CDF (Multiple Graphs)",
+    use_log_x: bool = True,
+    include_zeros: bool = True,
+):
+    """
+    Plots: percent of edges with load <= x  (empirical CDF) for multiple graphs.
+
+    Args:
+        graphs_dict: Dictionary mapping string labels to NetworkX graphs. Each edge must have attribute 'load' (float).
+        title: Plot title.
+        use_log_x: Whether to use log scale on x-axis.
+        include_zeros: Whether to include zero loads in the calculation.
+    """
+    if not graphs_dict:
+        print("No graphs provided.")
+        return
+
+    plt.figure(figsize=(10, 6))
+    
+    # Use a colormap to generate distinct colors for each graph
+    num_graphs = len(graphs_dict)
+    colors = plt.cm.tab10(np.linspace(0, 1, num_graphs)) if num_graphs <= 10 else plt.cm.tab20(np.linspace(0, 1, num_graphs))
+    
+    for idx, (label, G) in enumerate(graphs_dict.items()):
+        loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+
+        if not include_zeros:
+            loads = loads[loads > 0]
+
+        if loads.size == 0:
+            print(f"Graph '{label}' has no loads to plot (empty or all zero).")
+            continue
+
+        loads.sort()
+        y = (np.arange(1, loads.size + 1) / loads.size) * 100.0  # percent
+        
+        plt.plot(loads, y, color=colors[idx], label=label, linewidth=2)
+
+    plt.ylabel("Edges with load ≤ x (%)")
+    plt.xlabel("Edge load (bytes in matrix window)")
+    plt.title(title)
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.legend()
+
+    if use_log_x:
+        # log scale helps when loads span orders of magnitude
+        plt.xscale("log")
+
+    plt.ylim(0, 105)
+    plt.show()
