@@ -8,30 +8,41 @@ import networkx as nx
 
 from .abstract_topology import Topology, TopologyBuildResult
 
+
 class DragonflyPlus(Topology):
     """
-    A practical, port-limited Dragonfly+ style topology.
+    Dragonfly+ topology - paper-faithful implementation.
+
+    Based on: "Dragonfly+: Low Cost Topology for Scaling Datacenters"
+    by Shpiner et al., IEEE 2017.
 
     Model:
       - Endpoints (GPUs) are nodes [0..num_nodes-1]
-      - Routers are additional nodes [num_nodes .. num_nodes + g*a - 1]
+      - Routers are additional nodes [num_nodes .. num_nodes + g*(l+s) - 1]
+        - Leaf routers: Connect to p endpoints and s spine routers
+        - Spine routers: Connect to l leaf routers and h inter-group global links
+
+    Key constraints (from paper):
+      - Rule-of-thumb for full bisection bandwidth: p = l = s = h (Equation 1)
+      - Port balance: p = h = k/2 (Equation 2)
+      - Group size: N_group = p*l = k²/4
+      - Global links: ONLY spine-to-spine (never on leaves)
+      - Every pair of groups has at least one direct global link
 
     Parameters:
-      P: router_ports (same router type everywhere)
-      a: routers_per_group
-      p: endpoints_per_router
-      h: global_links_per_router
-      Local connectivity: within each group, routers form a clique (a-1 local links/router).
-      Global connectivity: deterministic "DF+"-like mapping that spreads links across groups
-                          to increase diversity. (One of many valid Dragonfly+ wirings.)
+      router_ports (k): Router radix
+      inter_group_variant: "largest" | "medium" | "small"
+        - "largest": Minimal global links (1 per group pair) - Figure 1a
+        - "medium": Every spine to every group (1 link) - Figure 1b
+        - "small": Every spine to every group (multiple parallel links) - Figure 1c
+      parallel_links_per_spine: For "small" variant, number of parallel links
 
-    Port constraint per router:
-      p + (a-1) + h <= P
-
-    Sizing:
-      - If a is not provided, we pick the largest a that fits the port budget
-        given p and h (this minimizes group count for a given num_nodes).
-      - g = ceil(num_nodes / (a*p))  (minimum groups to host endpoints)
+    Derived parameters (auto-calculated from k):
+      p = k/2  (endpoints per leaf router)
+      l = k/2  (leaf routers per group)
+      s = k/2  (spine routers per group)
+      h = k/2  (global links per spine router)
+      g = (s*h + 1)  (number of groups for "largest" variant)
     """
 
     def __init__(
@@ -39,85 +50,123 @@ class DragonflyPlus(Topology):
         num_nodes: int,
         *,
         router_ports: int = 64,
-        endpoints_per_router: int = 8,     # p
-        global_links_per_router: int = 8,  # h
-        routers_per_group: int | None = None,  # a (optional; auto-sized if None)
+        inter_group_variant: str = "medium",
+        parallel_links_per_spine: int = 1,
         link_capacity: float = 1.0,
         link_weight: float = 1.0,
     ) -> None:
         super().__init__(num_nodes)
 
-        if router_ports <= 1:
-            raise ValueError("router_ports must be > 1")
-        if endpoints_per_router <= 0:
-            raise ValueError("endpoints_per_router must be > 0")
-        if global_links_per_router < 0:
-            raise ValueError("global_links_per_router must be >= 0")
+        if router_ports <= 1 or router_ports % 2 != 0:
+            raise ValueError("router_ports must be even and > 1")
+        if inter_group_variant not in ("largest", "medium", "small"):
+            raise ValueError("inter_group_variant must be 'largest', 'medium', or 'small'")
+        if parallel_links_per_spine < 1:
+            raise ValueError("parallel_links_per_spine must be >= 1")
         if link_capacity <= 0:
             raise ValueError("link_capacity must be > 0")
         if link_weight <= 0:
             raise ValueError("link_weight must be > 0")
 
         self.router_ports = int(router_ports)
-        self.p = int(endpoints_per_router)
-        self.h = int(global_links_per_router)
-        self.a = int(routers_per_group) if routers_per_group is not None else None
-
+        self.inter_group_variant = str(inter_group_variant)
+        self.parallel_links_per_spine = int(parallel_links_per_spine)
         self.link_capacity = float(link_capacity)
         self.link_weight = float(link_weight)
 
+        # Paper-specified balancing: p = l = s = h = k/2
+        self.p = self.router_ports // 2
+        self.l = self.router_ports // 2
+        self.s = self.router_ports // 2
+        self.h = self.router_ports // 2
+
         self._cached_build: TopologyBuildResult | None = None
 
-    def _choose_a(self) -> int:
-        """Choose largest a that fits port budget, given p and h."""
-        # Need at least 1 router per group
-        max_a = self.router_ports - self.p - self.h + 1  # because (a-1) + p + h <= P
-        if max_a < 1:
-            raise ValueError(
-                f"Port budget impossible: need p+h <= P. Got p={self.p}, h={self.h}, P={self.router_ports}"
-            )
-        return max_a
+    def _compute_num_groups(self, variant: str) -> int:
+        """
+        Compute number of groups based on variant and endpoints.
+
+        For "largest": g = s*h + 1 (maximal network size)
+        For "medium"/"small": Minimize g to fit num_nodes
+        """
+        s, h, p, l = self.s, self.h, self.p, self.l
+
+        if variant == "largest":
+            # Maximum groups: each spine has h global links to different groups
+            return s * h + 1
+        else:
+            # Minimum groups to host all endpoints
+            endpoints_per_group = p * l  # k²/4
+            return int(np.ceil(self.num_nodes / endpoints_per_group))
+
+    def _validate_group_count(self, g: int) -> None:
+        """Validate that we can create required inter-group topology."""
+        s, h = self.s, self.h
+
+        if self.inter_group_variant == "largest":
+            # Each pair of groups needs one link
+            # Total global links available: g * s * h
+            # Total group pairs: g * (g-1)
+            # Need: g * (g-1) <= g * s * h
+            #   => (g-1) <= s*h
+            #   => g <= s*h + 1
+            if g > s * h + 1:
+                raise ValueError(
+                    f"Too many groups ({g}) for 'largest' variant. "
+                    f"Maximum is s*h+1 = {s*h+1} for router_ports={self.router_ports}"
+                )
+        elif self.inter_group_variant == "medium":
+            # Every spine connects to every other group (1 link each)
+            # Each spine needs (g-1) global links
+            # Must have: (g-1) <= h
+            if g - 1 > h:
+                raise ValueError(
+                    f"Too many groups ({g}) for 'medium' variant. "
+                    f"Maximum is h+1 = {h+1} for router_ports={self.router_ports}"
+                )
+        # "small" variant can support any g <= h+1 with multiple parallel links
 
     def build_topology(self) -> TopologyBuildResult:
         n = self.num_nodes
-        P = self.router_ports
-        p = self.p
-        h = self.h
-        a = self.a if self.a is not None else self._choose_a()
+        k = self.router_ports
+        p, l, s, h = self.p, self.l, self.s, self.h
 
-        # Validate port constraint
-        if p + (a - 1) + h > P:
+        # Determine number of groups
+        g = self._compute_num_groups(self.inter_group_variant)
+        self._validate_group_count(g)
+
+        # Total routers
+        routers_per_group = l + s
+        routers_total = g * routers_per_group
+
+        # Validate we can host all endpoints
+        total_endpoints_capacity = g * l * p
+        if total_endpoints_capacity < n:
             raise ValueError(
-                f"Port constraint violated: p+(a-1)+h={p+(a-1)+h} > P={P}. "
-                "Reduce routers_per_group (a), endpoints_per_router (p), or global_links_per_router (h)."
+                f"Insufficient capacity: can only host {total_endpoints_capacity} endpoints, "
+                f"need {n}. Increase router_ports or use different variant."
             )
 
-        # Minimum groups to host endpoints
-        routers_total_min = int(np.ceil(n / p))
-        g = int(np.ceil(routers_total_min / a))
-        routers_total = g * a
-
-        # If g==1, global links can't go anywhere meaningful; we’ll just omit them.
-        effective_h = h if g >= 2 else 0
-
         # Node IDs
-        gpu_ids = np.arange(0, n, dtype=np.int32)
         router_base = n
-        router_ids = np.arange(router_base, router_base + routers_total, dtype=np.int32)
-        total_nodes = int(router_base + routers_total)
+        total_nodes = router_base + routers_total
 
-        # Router indexing helpers
-        # group_id in [0..g-1], router_in_group in [0..a-1]
-        def rid(group_id: int, r_in_group: int) -> int:
-            return int(router_base + group_id * a + r_in_group)
+        # Helper functions for router IDs
+        def leaf_id(group_id: int, leaf_in_group: int) -> int:
+            return router_base + group_id * (l + s) + leaf_in_group
 
-        # Map GPUs -> routers (contiguous fill)
+        def spine_id(group_id: int, spine_in_group: int) -> int:
+            return router_base + group_id * (l + s) + l + spine_in_group
+
+        # Map GPUs -> leaf routers (contiguous fill)
         gpu_to_router = np.empty(n, dtype=np.int32)
         for i in range(n):
-            router_idx = i // p
-            gpu_to_router[i] = int(router_ids[router_idx])
+            leaf_idx = i // p  # Global leaf index
+            group_id = leaf_idx // l
+            leaf_in_group = leaf_idx % l
+            gpu_to_router[i] = leaf_id(group_id, leaf_in_group)
 
-        # Build edges (bidirectional physical links -> 2 directed edges)
+        # Build edges
         edges_u: List[int] = []
         edges_v: List[int] = []
 
@@ -125,40 +174,79 @@ class DragonflyPlus(Topology):
             edges_u.append(u); edges_v.append(v)
             edges_u.append(v); edges_v.append(u)
 
-        # (1) Endpoint <-> Router
+        # (1) Endpoint <-> Leaf Router
         for gpu in range(n):
-            add_bidir(int(gpu), int(gpu_to_router[gpu]))
+            add_bidir(gpu, int(gpu_to_router[gpu]))
 
-        # (2) Local links within each group: clique among routers in the group
+        # (2) Local bipartite links (Leaf <-> Spine within each group)
         for group_id in range(g):
-            routers = [rid(group_id, r) for r in range(a)]
-            for i in range(a):
-                for j in range(i + 1, a):
-                    add_bidir(routers[i], routers[j])
+            for leaf_in_group in range(l):
+                for spine_in_group in range(s):
+                    add_bidir(
+                        leaf_id(group_id, leaf_in_group),
+                        spine_id(group_id, spine_in_group)
+                    )
 
-        # (3) Global links: deterministic DF+-like spread across groups.
-        # We create exactly effective_h global links per router.
-        # To avoid duplicates, track undirected (min,max) pairs.
-        global_pairs = set()
+        # (3) Global inter-group links (Spine <-> Spine across groups)
+        # Implementation based on inter_group_variant
 
-        if effective_h > 0:
+        if g == 1:
+            # Single group: no global links needed
+            pass
+
+        elif self.inter_group_variant == "largest":
+            # Figure 1a: Each pair of groups connected by single global link
+            # Distribute links evenly across spine routers
+            for group_i in range(g):
+                for group_j in range(group_i + 1, g):
+                    # Pick spine routers for this group pair
+                    # Use deterministic mapping to distribute load
+                    spine_i = (group_i + group_j) % s
+                    spine_j = (group_i + group_j) % s
+
+                    add_bidir(
+                        spine_id(group_i, spine_i),
+                        spine_id(group_j, spine_j)
+                    )
+
+        elif self.inter_group_variant == "medium":
+            # Figure 1b: Every spine connects to every other group (1 link)
             for group_id in range(g):
-                for r in range(a):
-                    src = rid(group_id, r)
-                    for t in range(effective_h):
-                        # Choose a destination group that depends on (group,router,port)
-                        # offset >=1 ensures we don't pick same group unless g==1 (handled above)
-                        dest_group = (group_id + 1 + r * effective_h + t) % g
-                        dest_router = (r + t) % a
-                        dst = rid(dest_group, dest_router)
+                for spine_in_group in range(s):
+                    for dest_group in range(g):
+                        if dest_group == group_id:
+                            continue
 
-                        if src == dst:
+                        # Connect to corresponding spine in destination group
+                        # Use offset to distribute connections
+                        dest_spine = (spine_in_group + dest_group) % s
+
+                        src = spine_id(group_id, spine_in_group)
+                        dst = spine_id(dest_group, dest_spine)
+
+                        # Only add edge once (avoid duplicates from both directions)
+                        if group_id < dest_group or (group_id == dest_group and spine_in_group < dest_spine):
+                            add_bidir(src, dst)
+
+        elif self.inter_group_variant == "small":
+            # Figure 1c: Every spine connects to every other group (multiple parallel links)
+            for group_id in range(g):
+                for spine_in_group in range(s):
+                    for dest_group in range(g):
+                        if dest_group == group_id:
                             continue
-                        key = (min(src, dst), max(src, dst))
-                        if key in global_pairs:
-                            continue
-                        global_pairs.add(key)
-                        add_bidir(src, dst)
+
+                        # Create multiple parallel links
+                        for link_idx in range(self.parallel_links_per_spine):
+                            dest_spine = (spine_in_group + dest_group + link_idx) % s
+
+                            src = spine_id(group_id, spine_in_group)
+                            dst = spine_id(dest_group, dest_spine)
+
+                            # Add bidirectional parallel link
+                            # Note: We add all parallel links (not deduping)
+                            if group_id < dest_group or (group_id == dest_group and spine_in_group < dest_spine):
+                                add_bidir(src, dst)
 
         edges = np.column_stack(
             (np.asarray(edges_u, dtype=np.int32), np.asarray(edges_v, dtype=np.int32))
@@ -169,27 +257,41 @@ class DragonflyPlus(Topology):
         weight = np.full((m,), self.link_weight, dtype=np.float32)
 
         meta: Dict[str, Any] = {
-            "topology": "Dragonfly+ (port-limited, clique-local, deterministic-global)",
+            "topology": "Dragonfly+ (paper-faithful, bipartite leaf-spine)",
+            "paper": "Shpiner et al., IEEE 2017",
             "num_endpoints": n,
-            "router_ports": P,
+            "router_ports": k,
             "params": {
-                "routers_per_group": a,
-                "endpoints_per_router": p,
-                "global_links_per_router": h,
-                "effective_global_links_per_router": effective_h,
                 "groups": g,
-                "routers_total": routers_total,
+                "routers_per_group": l + s,
+                "total_routers": routers_total,
+                "leaves_per_group": l,
+                "spines_per_group": s,
+                "endpoints_per_router": p,
+                "global_links_per_spine": h,
+                "inter_group_variant": self.inter_group_variant,
+                "parallel_links_per_spine": self.parallel_links_per_spine if self.inter_group_variant == "small" else 1,
+                "balancing_rule": f"p=l=s=h={p}",
             },
-            "port_accounting_per_router": {
-                "endpoint_ports": p,
-                "local_ports": a - 1,
-                "global_ports": effective_h,
-                "total_used": p + (a - 1) + effective_h,
-                "budget": P,
+            "port_accounting": {
+                "leaf_router": {
+                    "endpoint_ports": p,
+                    "spine_ports": s,
+                    "total_used": p + s,
+                    "budget": k,
+                },
+                "spine_router": {
+                    "leaf_ports": l,
+                    "global_ports": h,
+                    "total_used": l + h,
+                    "budget": k,
+                },
             },
             "counts": {
                 "total_nodes_including_routers": total_nodes,
-                "routers": routers_total,
+                "total_routers": routers_total,
+                "leaf_routers": g * l,
+                "spine_routers": g * s,
                 "endpoints": n,
             },
             "node_ranges": {
@@ -203,24 +305,27 @@ class DragonflyPlus(Topology):
         self._cached_build = res
         return res
 
-    def convert_to_networkx(self) -> nx.DiGraph:
+    def convert_to_networkx(self) -> nx.MultiDiGraph:
         """
-        Convert built topology to NetworkX DiGraph with deterministic adjacency order.
+        Convert to NetworkX MultiDiGraph to support parallel links.
+
+        Uses MultiDiGraph (not DiGraph) because Dragonfly+ explicitly
+        supports parallel links between spine routers (Figure 1c).
         """
         res = self._cached_build if self._cached_build is not None else self.build_topology()
         edges = res.edges
         cap = res.attrs.get("capacity")
         w = res.attrs.get("weight")
 
-        # deterministic order by (u,v)
-        order = np.lexsort((edges[:, 1], edges[:, 0]))
+        # Use MultiDiGraph to preserve parallel links
+        G = nx.MultiDiGraph()
 
-        G = nx.DiGraph()
         total_nodes = res.meta.get("counts", {}).get("total_nodes_including_routers")
         if isinstance(total_nodes, int):
             G.add_nodes_from(range(total_nodes))
 
-        for idx in order:
+        # Add all edges (including parallel ones)
+        for idx in range(edges.shape[0]):
             u, v = int(edges[idx, 0]), int(edges[idx, 1])
             attrs: Dict[str, Any] = {"edge_id": int(idx)}
             if cap is not None:
