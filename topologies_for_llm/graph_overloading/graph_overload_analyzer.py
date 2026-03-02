@@ -4,12 +4,13 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
+import sys
+from pathlib import Path
+from copy import deepcopy
 
 from assign_and_plot import (
     annotate_graph_with_loads,
-    assign_od_to_edges_shortest_first,
-    draw_fattree_load_heat,
-    draw_fattree_overload,
+    assign_od_to_edges_shortest,
     plot_edge_load_cdf,
     plot_edge_load_cdf_multiple
 )
@@ -19,6 +20,8 @@ from topologies.hyperx import HyperX
 
 matrices_moe = '/Users/eavidan/Documents/topology_repo/simai/final_output/matrices_moe'
 matrices = '/Users/eavidan/Documents/topology_repo/simai/final_output/matrices'
+
+this_dir = Path(__file__).parent
 
 #!/usr/bin/env python3
 """
@@ -32,7 +35,6 @@ Assumptions:
 """
 
 import argparse
-from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
@@ -104,7 +106,7 @@ def run_one_workload_on_fattree(workloads: dict, workload_name: str, *, switch_p
     ft = FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports, link_capacity=1.0, link_weight=1.0)
     G = ft.convert_to_networkx()
 
-    edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
+    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight")
 
     # Infinite capacity => util is irrelevant; just store load
     annotate_graph_with_loads(G, edge_load, capacity=None)
@@ -135,7 +137,7 @@ def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_po
     )
     G = hx.convert_to_networkx()
 
-    edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
+    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight")
 
     # Infinite capacity => util is irrelevant; just store load
     annotate_graph_with_loads(G, edge_load, capacity=None)
@@ -153,21 +155,24 @@ def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_po
     )
 
 
-def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, router_ports=64, endpoints_per_router=8, global_links_per_router=8):
+def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, router_ports=64, inter_group_variant="medium"):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
+    # Dragonfly+ paper-faithful implementation (Shpiner et al., IEEE 2017):
+    # - Enforces p=l=s=h=k/2 balancing rule (Equation 1)
+    # - Global links ONLY on spine routers (spine-to-spine)
+    # - Three inter-group variants: "largest" (minimal), "medium", "small" (parallel links)
     dfp = DragonflyPlus(
         num_nodes=n,
         router_ports=router_ports,
-        endpoints_per_router=endpoints_per_router,
-        global_links_per_router=global_links_per_router,
+        inter_group_variant=inter_group_variant,
         link_capacity=1.0,
         link_weight=1.0,
     )
     G = dfp.convert_to_networkx()
 
-    edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
+    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight")
 
     # Infinite capacity => util is irrelevant; just store load
     annotate_graph_with_loads(G, edge_load, capacity=None)
@@ -184,20 +189,63 @@ def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, r
         include_zeros=True,
     )
 
-def create_all_topologies_and_graphs(workloads: dict, workload_name: str, switch_ports: int = 64, down_ports: int = None, router_ports: int = 64, endpoints_per_router: int = 8, global_links_per_router: int = 8):
-    graphs = {}
+def create_all_topologies_and_graphs(
+    workloads: dict,
+    workload_name: str,
+    *,
+    workload_type: str,          # "moe" or "dense"
+    root_save_dir: str,          # path to edge_load_comparisons
+    switch_ports: int = 64,
+    down_ports: int | None = None,
+    router_ports: int = 64,
+    endpoints_per_router: int = 8,
+    inter_group_variant: str = "medium",
+    use_log_x: bool = True,
+    include_zeros: bool = True,
+):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
-    graphs["Fat Tree"] = FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports, link_capacity=1.0, link_weight=1.0).convert_to_networkx()
-    graphs["HyperX"] = HyperX(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router, link_capacity=1.0, link_weight=1.0).convert_to_networkx()
-    graphs["Dragonfly+"] = DragonflyPlus(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router, global_links_per_router=global_links_per_router, link_capacity=1.0, link_weight=1.0).convert_to_networkx()
-    
-    for G in graphs.values():
-        edge_load = assign_od_to_edges_shortest_first(G, OD, weight="weight")
-        annotate_graph_with_loads(G, edge_load, capacity=None)
-    
-    plot_edge_load_cdf_multiple(graphs, title=f"Edge-load CDF - {workload_name}", use_log_x=True, include_zeros=True)
+    base_graphs = {
+        "Fat Tree": FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports,
+                            link_capacity=1.0, link_weight=1.0).convert_to_networkx(),
+        "HyperX": HyperX(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router,
+                         link_capacity=1.0, link_weight=1.0).convert_to_networkx(),
+        "Dragonfly+": DragonflyPlus(
+            num_nodes=n,
+            router_ports=router_ports,
+            inter_group_variant=inter_group_variant,
+            link_capacity=1.0,
+            link_weight=1.0
+        ).convert_to_networkx(),
+    }
+
+    variants = [
+        ("single_path", False),
+        ("equal_spread", True),
+    ]
+
+    for variant_dirname, split_equal_shortest in variants:
+        graphs_variant = {}
+
+        for topo_name, G_base in base_graphs.items():
+            G = deepcopy(G_base)
+            edge_load = assign_od_to_edges_shortest(
+                G, OD, weight="weight", split_equal_shortest=split_equal_shortest
+            )
+            annotate_graph_with_loads(G, edge_load, capacity=None)
+            graphs_variant[topo_name] = G
+
+        save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
+        plot_edge_load_cdf_multiple(
+            graphs_variant,
+            title=f"Edge-load CDF - {workload_name} ({variant_dirname})",
+            use_log_x=use_log_x,
+            include_zeros=include_zeros,
+            save_dir=save_dir,
+            filename=f"{workload_name}.png",   # one file per workload per variant
+        )
+
 
 def main() -> None:
     matrices_dirs = [matrices_moe, matrices]
@@ -217,11 +265,26 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
-        chosen = next(iter(workloads.keys()))
         # run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
         # run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
         # run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
 
-        create_all_topologies_and_graphs(workloads, chosen, switch_ports=64, down_ports=None, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
+        base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
+        total_workloads = len(workloads)
+        for i, workload_name in enumerate(workloads.keys()):
+            print(f"\nProcessing workload: {workload_name}")
+            print(f"Progress: {(i+1) / total_workloads * 100:.1f}%")
+            create_all_topologies_and_graphs(
+                workloads,
+                workload_name,
+                workload_type=workload_type,
+                root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
+                switch_ports=64,
+                down_ports=None,
+                router_ports=64,
+                endpoints_per_router=8,
+                inter_group_variant="medium",
+            )
+
 if __name__ == "__main__":
     main()

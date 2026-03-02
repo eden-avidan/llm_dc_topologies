@@ -6,17 +6,32 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import math
+import os
+
+from collections import defaultdict
+import networkx as nx
 
 
-def assign_od_to_edges_shortest_first(G: nx.DiGraph, OD_csr, weight="weight"):
+def assign_od_to_edges_shortest(
+    G: nx.DiGraph,
+    OD_csr,
+    *,
+    weight: str = "weight",
+    split_equal_shortest: bool = False,
+):
     """
-    Routing model #1:
-      shortest path; if multiple shortest paths exist, NetworkX returns one
-      (your FatTree.convert_to_networkx sorts edges, so tie-break is stable/"first by order").
+    Route each nonzero OD demand on shortest paths and accumulate per-edge load.
+
+    If split_equal_shortest=False (default):
+        - Uses ONE shortest path per (s,t) (NetworkX tie-break / adjacency order).
+    If split_equal_shortest=True:
+        - Splits demand evenly across ALL equal-cost shortest paths (ECMP-style).
+
+    Returns: dict[(u,v)] -> load
     """
     edge_load = defaultdict(float)
-
     n = OD_csr.shape[0]
+
     for s in range(n):
         row_start = OD_csr.indptr[s]
         row_end = OD_csr.indptr[s + 1]
@@ -32,11 +47,21 @@ def assign_od_to_edges_shortest_first(G: nx.DiGraph, OD_csr, weight="weight"):
             if demand <= 0 or s == t:
                 continue
 
-            path = nx.shortest_path(G, source=s, target=t, weight=weight)
-            for u, v in zip(path[:-1], path[1:]):
-                edge_load[(u, v)] += demand
+            if not split_equal_shortest:
+                path = nx.shortest_path(G, source=s, target=t, weight=weight)
+                for u, v in zip(path[:-1], path[1:]):
+                    edge_load[(u, v)] += demand
+            else:
+                paths = list(nx.all_shortest_paths(G, source=s, target=t, weight=weight))
+                k = len(paths)
+                if k == 0:
+                    continue
+                share = demand / k
+                for path in paths:
+                    for u, v in zip(path[:-1], path[1:]):
+                        edge_load[(u, v)] += share
 
-    return edge_load
+    return dict(edge_load)
 
 
 
@@ -210,6 +235,8 @@ def plot_edge_load_cdf_multiple(
     title: str = "Edge-load CDF (Multiple Graphs)",
     use_log_x: bool = True,
     include_zeros: bool = True,
+    save_dir: str | None = None,
+    filename: str | None = None,
 ):
     """
     Plots: percent of edges with load <= x  (empirical CDF) for multiple graphs.
@@ -256,4 +283,11 @@ def plot_edge_load_cdf_multiple(
         plt.xscale("log")
 
     plt.ylim(0, 105)
-    plt.show()
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_name = filename if filename is not None else f"{title}.png"
+        plt.savefig(os.path.join(save_dir, out_name), dpi=200, bbox_inches="tight")
+        plt.close()
+    else:
+        plt.show()
+    
