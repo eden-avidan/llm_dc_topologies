@@ -14,7 +14,8 @@ from assign_and_plot import (
     plot_edge_load_cdf,
     plot_edge_load_cdf_multiple,
     plot_edge_load_bucket_hist_multiple,
-    plot_edge_load_percentiles_multiple
+    plot_edge_load_percentiles_multiple,
+    plot_shortest_path_heatmap
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -209,8 +210,7 @@ def create_all_topologies_and_graphs(
     n = OD.shape[0]
 
     base_graphs = {
-        "Fat Tree": FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports,
-                            link_capacity=1.0, link_weight=1.0).convert_to_networkx(),
+        "Fat Tree": FatTree(num_nodes=n).convert_to_networkx(),
         "HyperX": HyperX(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router,
                          link_capacity=1.0, link_weight=1.0).convert_to_networkx(),
         "Dragonfly+": DragonflyPlus(
@@ -237,6 +237,18 @@ def create_all_topologies_and_graphs(
             )
             annotate_graph_with_loads(G, edge_load, capacity=None)
             graphs_variant[topo_name] = G
+
+        # heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
+        for topo_name, graph in graphs_variant.items():
+            plot_shortest_path_heatmap(
+                graph,
+                num_endpoints=n,  # Only show GPU nodes (0 to n-1), matching transport matrix
+                title=f"{topo_name} - Shortest path heatmap - {workload_name}",
+                x_label="Target GPU",
+                y_label="Source GPU",
+                # save_dir=heatmap_save_dir,
+                filename=f"{topo_name.replace(' ', '_')}_{workload_name}.png",
+            )
 
         save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
         plot_edge_load_cdf_multiple(
@@ -280,7 +292,11 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
-        chosen = next(iter(workloads.keys()))
+        # Choose a workload with world_size=128
+        chosen = next((name for name, M in workloads.items() if M.shape[0] == 128), None)
+        if chosen is None:
+            print("No workload with world_size=128 found, using first available.")
+            chosen = next(iter(workloads.keys()))
         # run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
         # run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
         # run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)

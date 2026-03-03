@@ -5,11 +5,10 @@ import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import seaborn as sns
 import math
 import os
-
-from collections import defaultdict
-import networkx as nx
 
 
 def assign_od_to_edges_shortest(
@@ -622,3 +621,194 @@ def plot_edge_load_bucket_hist_multiple(
         plt.close()
     else:
         plt.show()
+
+
+def plot_shortest_path_heatmap(
+    G: nx.Graph | nx.DiGraph,
+    *,
+    title: str = "Shortest Path Length Heatmap",
+    node_order: list | None = None,
+    num_endpoints: int | None = None,
+    num_ticks: int = 42,
+    x_label: str = "Target Node",
+    y_label: str = "Source Node",
+    save_dir: str | None = None,
+    filename: str | None = None,
+    figsize: tuple[int, int] = (10, 8),
+    dpi: int = 300,
+):
+    """
+    Generate a heatmap showing shortest path lengths (number of edges) between all node pairs.
+    
+    The heat value for cell (i, j) represents the number of edges in the shortest path
+    from node i to node j. Unreachable pairs are shown as NaN (masked/white).
+    
+    Args:
+        G: NetworkX graph (directed or undirected).
+        title: Plot title.
+        node_order: Optional list specifying the order of nodes in the matrix.
+                    If None, uses sorted(G.nodes()) or endpoints only if num_endpoints is set.
+        num_endpoints: If set, only include nodes 0 to num_endpoints-1 (GPU/endpoint nodes).
+                       This is useful to filter out switch/router nodes and show only
+                       GPU-to-GPU distances matching the transport matrix order.
+        num_ticks: Number of ticks to show on x and y axes (default: 42).
+        x_label: Label for x-axis (target nodes).
+        y_label: Label for y-axis (source nodes).
+        save_dir/filename: If set, save plot to disk. Otherwise show.
+        figsize: Figure size as (width, height).
+        dpi: Resolution for saved figure.
+    """
+    if G.number_of_nodes() == 0:
+        print("Graph has no nodes.")
+        return
+    
+    # Determine node order
+    if node_order is None:
+        if num_endpoints is not None:
+            # Use only endpoint nodes (0 to num_endpoints-1), matching transport matrix order
+            node_order = list(range(num_endpoints))
+        else:
+            try:
+                node_order = sorted(G.nodes())
+            except TypeError:
+                # Nodes not sortable, use arbitrary order
+                node_order = list(G.nodes())
+    
+    n = len(node_order)
+    node_to_idx = {node: idx for idx, node in enumerate(node_order)}
+    
+    # Compute all-pairs shortest path lengths
+    # Using unweighted shortest path (number of edges)
+    dist_matrix = np.full((n, n), np.nan, dtype=float)
+    
+    for source in node_order:
+        try:
+            lengths = nx.single_source_shortest_path_length(G, source)
+            src_idx = node_to_idx[source]
+            for target, length in lengths.items():
+                if target in node_to_idx:
+                    tgt_idx = node_to_idx[target]
+                    dist_matrix[src_idx, tgt_idx] = length
+        except nx.NetworkXError:
+            # Source not in graph or other error
+            continue
+    
+    # Determine discrete values present in the matrix
+    valid_values = dist_matrix[~np.isnan(dist_matrix)]
+    if valid_values.size == 0:
+        print("No reachable paths in the graph.")
+        return
+    
+    min_dist = int(np.min(valid_values))
+    max_dist = int(np.max(valid_values))
+    discrete_values = list(range(min_dist, max_dist + 1))
+    
+    # Create discrete colormap using viridis
+    cmap = ListedColormap(plt.cm.viridis(np.linspace(0, 1, len(discrete_values))))
+    
+    # Boundaries for discrete colors
+    bounds = np.arange(len(discrete_values) + 1) - 0.5 + min_dist
+    norm = BoundaryNorm(bounds, cmap.N)
+    
+    # Plot
+    plt.figure(figsize=figsize)
+    
+    sns.heatmap(
+        dist_matrix,
+        cmap=cmap,
+        norm=norm,
+        square=True,
+        cbar=True,
+        mask=np.isnan(dist_matrix),
+        vmin=min(discrete_values),
+        vmax=max(discrete_values),
+        linewidths=0,
+        linecolor=None,
+        xticklabels=False,  # Hide individual tick labels for large graphs
+        yticklabels=False,
+    )
+    
+    # Configure colorbar with discrete ticks
+    cbar = plt.gca().collections[0].colorbar
+    cbar.set_ticks(discrete_values)
+    cbar.set_ticklabels([str(v) for v in discrete_values])
+    cbar.set_label("Shortest Path Length (edges)")
+    
+    # Add linear ticks on x and y axes
+    ax = plt.gca()
+    if num_ticks > 0 and n > 1:
+        # Calculate tick positions (linear spacing)
+        tick_positions = np.linspace(0, n - 1, min(num_ticks, n)).astype(int)
+        # Get corresponding node labels
+        tick_labels = [str(node_order[i]) for i in tick_positions]
+        
+        ax.set_xticks(tick_positions + 0.5)  # +0.5 to center on cells
+        ax.set_xticklabels(tick_labels, rotation=90, fontsize=7)
+        ax.set_yticks(tick_positions + 0.5)
+        ax.set_yticklabels(tick_labels, fontsize=7)
+    
+    plt.title(title, fontsize=14)
+    plt.xlabel(x_label, fontsize=12)
+    plt.ylabel(y_label, fontsize=12)
+    
+    plt.tight_layout()
+    
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_name = filename if filename is not None else f"{title.replace(' ', '_')}.png"
+        plt.savefig(os.path.join(save_dir, out_name), dpi=dpi, bbox_inches="tight")
+        plt.close()
+    else:
+        plt.show()
+
+
+def plot_shortest_path_heatmap_multiple(
+    graphs_dict: dict[str, nx.Graph | nx.DiGraph],
+    *,
+    node_order: list | None = None,
+    num_endpoints: int | None = None,
+    num_ticks: int = 42,
+    x_label: str = "Target Node",
+    y_label: str = "Source Node",
+    save_dir: str | None = None,
+    figsize: tuple[int, int] = (10, 8),
+    dpi: int = 300,
+):
+    """
+    Generate shortest path length heatmaps for multiple graphs.
+    
+    Args:
+        graphs_dict: Dictionary mapping labels to NetworkX graphs.
+        node_order: Optional list specifying the order of nodes (shared across all graphs).
+        num_endpoints: If set, only include nodes 0 to num_endpoints-1 (GPU/endpoint nodes).
+        num_ticks: Number of ticks to show on x and y axes (default: 42).
+        x_label: Label for x-axis.
+        y_label: Label for y-axis.
+        save_dir: Directory to save plots. If None, shows interactively.
+        figsize: Figure size as (width, height).
+        dpi: Resolution for saved figures.
+    """
+    if not graphs_dict:
+        print("No graphs provided.")
+        return
+    
+    for label, G in graphs_dict.items():
+        title = f"{label} – Shortest Path Heatmap"
+        filename = f"{label.replace(' ', '_')}_heatmap.png" if save_dir else None
+        
+        plot_shortest_path_heatmap(
+            G,
+            title=title,
+            node_order=node_order,
+            num_endpoints=num_endpoints,
+            num_ticks=num_ticks,
+            x_label=x_label,
+            y_label=y_label,
+            save_dir=save_dir,
+            filename=filename,
+            figsize=figsize,
+            dpi=dpi,
+        )
+        
+        if save_dir:
+            print(f"✅ Saved heatmap for {label}")
