@@ -257,6 +257,26 @@ def plot_edge_load_cdf_multiple(
     num_graphs = len(graphs_dict)
     colors = plt.cm.tab10(np.linspace(0, 1, num_graphs)) if num_graphs <= 10 else plt.cm.tab20(np.linspace(0, 1, num_graphs))
     
+    # Markers for distinguishing lines
+    markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
+    
+    # First pass: find global minimum first_positive across all graphs for common x_start
+    global_min_positive = float('inf')
+    for G in graphs_dict.values():
+        loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+        if not include_zeros:
+            loads = loads[loads > 0]
+        if loads.size == 0:
+            continue
+        positive_loads = loads[loads > 0]
+        if positive_loads.size > 0:
+            global_min_positive = min(global_min_positive, float(np.min(positive_loads)))
+    
+    # Calculate global x_start so all plots begin at the same point
+    if global_min_positive == float('inf'):
+        global_min_positive = 1.0  # fallback
+    global_x_start = global_min_positive / 10 if use_log_x else max(0, global_min_positive - 1)
+    
     for idx, (label, G) in enumerate(graphs_dict.items()):
         loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
 
@@ -270,7 +290,24 @@ def plot_edge_load_cdf_multiple(
         loads.sort()
         y = (np.arange(1, loads.size + 1) / loads.size) * 100.0  # percent
         
-        plt.plot(loads, y, color=colors[idx], label=label, linewidth=2)
+        # Find where first non-zero load starts
+        num_zeros = np.searchsorted(loads, 0, side='right')
+        first_positive = loads[num_zeros] if num_zeros < len(loads) else loads[-1]
+        
+        # Build the plot data: start with zeros at y=0 from global_x_start, then the actual CDF
+        if num_zeros > 0:
+            # There are zeros - show them as a horizontal line at y=0
+            # Plot: global_x_start -> first_positive at y=0, then the CDF rises
+            plot_x = np.concatenate([[global_x_start, first_positive], loads[num_zeros:]])
+            plot_y = np.concatenate([[0, 0], y[num_zeros:]])
+        else:
+            # No zeros - draw horizontal at y=0 from global_x_start to first data point
+            plot_x = np.concatenate([[global_x_start, loads[0]], loads])
+            plot_y = np.concatenate([[0, 0], y])
+        
+        marker = markers[idx % len(markers)]
+        plt.plot(plot_x, plot_y, color=colors[idx], label=label, linewidth=2, 
+                 marker=marker, markersize=5, markevery=max(1, len(plot_x) // 15))
 
     plt.ylabel("Edges with load ≤ x (%)")
     plt.xlabel("Edge load (bytes in matrix window)")
@@ -291,3 +328,184 @@ def plot_edge_load_cdf_multiple(
     else:
         plt.show()
     
+
+def plot_edge_load_bucket_hist_multiple(
+    graphs_dict,
+    *,
+    title: str = "Edge-load bucket comparison",
+    include_zeros: bool = True,
+    use_log_buckets: bool = True,
+    num_buckets: int = 12,
+    bucket_edges: np.ndarray | None = None,
+    x_label: str = "Edge load bucket",
+    y_label: str = "Edges in bucket (%)",
+    save_dir: str | None = None,
+    filename: str | None = None,
+):
+    """
+    Bucketed comparison across multiple graphs.
+
+    For each graph:
+      - Collect edge loads from edge attribute 'load'
+      - Bucket them into common bins
+      - Plot grouped bars: x=buckets, y=percent of edges in bucket
+
+    Args:
+        graphs_dict: dict[label -> NetworkX graph]. Legend uses dict keys.
+        include_zeros: If False, remove 0-load edges before bucketing.
+        use_log_buckets: If True, bins are log-spaced (recommended when loads span orders of magnitude).
+        num_buckets: Number of buckets if bucket_edges is not provided.
+        bucket_edges: Optional explicit bin edges (length = num_buckets+1). If provided, overrides use_log_buckets/num_buckets.
+        save_dir/filename: If set, save plot to disk. Otherwise show.
+    """
+    if not graphs_dict:
+        print("No graphs provided.")
+        return
+
+    labels = list(graphs_dict.keys())
+
+    # ---- collect loads and also global min/max (for shared bins) ----
+    loads_by_label: dict[str, np.ndarray] = {}
+    global_vals = []
+
+    for label, G in graphs_dict.items():
+        loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+        if not include_zeros:
+            loads = loads[loads > 0]
+        loads_by_label[label] = loads
+
+        if loads.size > 0:
+            global_vals.append(loads)
+
+    if not global_vals:
+        print("All graphs have no loads to plot (empty or all zero).")
+        return
+
+    global_vals = np.concatenate(global_vals)
+    global_min = float(np.min(global_vals))
+    global_max = float(np.max(global_vals))
+
+    # ---- build common bucket edges ----
+    if bucket_edges is None:
+        if use_log_buckets:
+            # log buckets can't include 0; if zeros included, they will be handled separately via a first bucket
+            # We'll make bins over positive range and optionally add a zero bucket.
+            positive = global_vals[global_vals > 0]
+            if positive.size == 0:
+                # everything is zero
+                bucket_edges = np.array([0.0, 1.0], dtype=float)
+                num_buckets = 1
+            else:
+                pmin = float(np.min(positive))
+                pmax = float(np.max(positive))
+                # avoid degenerate ranges
+                if pmax <= pmin:
+                    pmax = pmin * 10.0
+                
+                # Linear stepping within each order of magnitude (e.g., 1, 2, 3, ... or 1, 1.5, 2, ...)
+                # Using coefficient step of 1 (can change to 0.5 for finer granularity)
+                coeff_step = 2.0  # coefficients: 1, 2, 3, ..., 9  (use 0.5 for 1, 1.5, 2, ...)
+                
+                exp_min = int(np.floor(np.log10(pmin)))
+                exp_max = int(np.ceil(np.log10(pmax)))
+                
+                edges = []
+                for exp in range(exp_min, exp_max + 1):
+                    base = 10.0 ** exp
+                    coeffs = np.arange(1.0, 10.0, coeff_step)
+                    for c in coeffs:
+                        val = c * base
+                        if val >= pmin and val <= pmax * 1.01:  # small tolerance
+                            edges.append(val)
+                
+                # Ensure we have the endpoints
+                if not edges or edges[0] > pmin:
+                    edges.insert(0, pmin)
+                if edges[-1] < pmax:
+                    edges.append(pmax)
+                
+                bucket_edges = np.array(sorted(set(edges)), dtype=float)
+
+                # If we include zeros, prepend a [0, first_edge) bucket.
+                if include_zeros:
+                    bucket_edges = np.concatenate(([0.0], bucket_edges))
+        else:
+            # linear buckets across full range
+            if global_max <= global_min:
+                global_max = global_min + 1.0
+            bucket_edges = np.linspace(global_min, global_max, num_buckets + 1)
+
+    bucket_edges = np.asarray(bucket_edges, dtype=float)
+    if bucket_edges.ndim != 1 or bucket_edges.size < 2:
+        raise ValueError("bucket_edges must be a 1D array with at least 2 entries.")
+    if not np.all(bucket_edges[1:] >= bucket_edges[:-1]):
+        raise ValueError("bucket_edges must be non-decreasing.")
+
+    # ---- compute bucket percentages for each graph ----
+    # hist[i] = count in bin i where bins are [edge[i], edge[i+1])
+    bucket_counts = []
+    for label in labels:
+        loads = loads_by_label[label]
+        if loads.size == 0:
+            counts = np.zeros(bucket_edges.size - 1, dtype=float)
+        else:
+            counts, _ = np.histogram(loads, bins=bucket_edges)
+        # convert to percent
+        denom = loads.size if loads.size > 0 else 1.0
+        bucket_counts.append(100.0 * counts / denom)
+
+    bucket_counts = np.stack(bucket_counts, axis=0)  # shape: (num_graphs, num_bins)
+
+    # ---- format x tick labels ----
+    def _fmt(v: float) -> str:
+        if v == 0.0:
+            return "0"
+        if v < 1e-10:
+            return "0"
+        # Extract coefficient and exponent, show as "Ce±X" (e.g., "2e6", "1.5e9")
+        exp = int(np.floor(np.log10(abs(v))))
+        coeff = v / (10.0 ** exp)
+        # Clean up coefficient display
+        if abs(coeff - round(coeff)) < 0.01:
+            coeff_str = str(int(round(coeff)))
+        else:
+            coeff_str = f"{coeff:.1f}".rstrip('0').rstrip('.')
+        return f"{coeff_str}e{exp}"
+
+    bin_labels = []
+    for i in range(bucket_edges.size - 1):
+        left = bucket_edges[i]
+        right = bucket_edges[i + 1]
+        # Show only the left edge value for cleaner labels
+        bin_labels.append(_fmt(left))
+
+    # ---- plot grouped bars ----
+    num_bins = bucket_edges.size - 1
+    num_graphs = len(labels)
+
+    x = np.arange(num_bins, dtype=float)
+    group_width = 0.85
+    bar_width = group_width / max(1, num_graphs)
+
+    plt.figure(figsize=(max(10, num_bins * 0.6), 6))
+
+    for gi, label in enumerate(labels):
+        offsets = x - group_width / 2 + (gi + 0.5) * bar_width
+        plt.bar(offsets, bucket_counts[gi], width=bar_width, label=label)
+
+    plt.xticks(x, bin_labels, rotation=45, ha="right")
+    plt.ylabel(y_label)
+    plt.xlabel(x_label)
+    plt.title(title)
+    plt.grid(True, axis="y", linestyle="--", linewidth=0.5)
+    plt.legend()
+
+    plt.tight_layout()
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_name = filename if filename is not None else f"{title}.png"
+        plt.savefig(os.path.join(save_dir, out_name), dpi=200, bbox_inches="tight")
+        plt.close()
+    else:
+        plt.show()
