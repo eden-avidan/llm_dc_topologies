@@ -12,7 +12,9 @@ from assign_and_plot import (
     annotate_graph_with_loads,
     assign_od_to_edges_shortest,
     plot_edge_load_cdf,
-    plot_edge_load_cdf_multiple
+    plot_edge_load_cdf_multiple,
+    plot_edge_load_bucket_hist_multiple,
+    plot_edge_load_percentiles_multiple
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -242,7 +244,20 @@ def create_all_topologies_and_graphs(
             title=f"Edge-load CDF - {workload_name} ({variant_dirname})",
             use_log_x=use_log_x,
             include_zeros=include_zeros,
-            save_dir=save_dir,
+            filename=f"{workload_name}.png",   # one file per workload per variant
+        )
+
+        plot_edge_load_bucket_hist_multiple(
+            graphs_variant,
+            title=f"Edge-load bucket histogram - {workload_name} ({variant_dirname})",
+            include_zeros=include_zeros,
+            filename=f"{workload_name}.png",   # one file per workload per variant
+        )
+
+        plot_edge_load_percentiles_multiple(
+            graphs_variant,
+            title=f"Edge-load percentiles - {workload_name} ({variant_dirname})",
+            include_zeros=include_zeros,
             filename=f"{workload_name}.png",   # one file per workload per variant
         )
 
@@ -265,26 +280,39 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
+        chosen = next(iter(workloads.keys()))
         # run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
         # run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
         # run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
 
-        base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
-        total_workloads = len(workloads)
-        for i, workload_name in enumerate(workloads.keys()):
-            print(f"\nProcessing workload: {workload_name}")
-            print(f"Progress: {(i+1) / total_workloads * 100:.1f}%")
-            create_all_topologies_and_graphs(
-                workloads,
-                workload_name,
-                workload_type=workload_type,
-                root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-                switch_ports=64,
-                down_ports=None,
-                router_ports=64,
-                endpoints_per_router=8,
-                inter_group_variant="medium",
-            )
+        # base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
+        # total_workloads = len(workloads)
+        # for i, workload_name in enumerate(workloads.keys()):
+        #     print(f"\nProcessing workload: {workload_name}")
+        #     print(f"Progress: {(i+1) / total_workloads * 100:.1f}%")
+        #     create_all_topologies_and_graphs(
+        #         workloads,
+        #         workload_name,
+        #         workload_type=workload_type,
+        #         root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
+        #         switch_ports=64,
+        #         down_ports=None,
+        #         router_ports=64,
+        #         endpoints_per_router=8,
+        #         inter_group_variant="medium",
+        #     )
+
+        create_all_topologies_and_graphs(
+            workloads,
+            chosen,
+            workload_type=workload_type,
+            root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
+            switch_ports=64,
+            down_ports=None,
+            router_ports=64,
+            endpoints_per_router=8,
+            inter_group_variant="medium",
+        )
 
 if __name__ == "__main__":
     main()

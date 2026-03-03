@@ -327,6 +327,119 @@ def plot_edge_load_cdf_multiple(
         plt.close()
     else:
         plt.show()
+
+
+def plot_edge_load_percentiles_multiple(
+    graphs_dict,
+    *,
+    percentiles: list[float] | None = None,
+    title: str = "Edge-load Percentiles (Multiple Graphs)",
+    use_log_y: bool = True,
+    include_zeros: bool = True,
+    connect_points: bool = True,
+    label_points: bool = True,
+    save_dir: str | None = None,
+    filename: str | None = None,
+):
+    """
+    Plots percentile (quantile) comparison across multiple graphs.
+    
+    X-axis: percentile (%), Y-axis: load value at that percentile.
+    Each point represents the x-th percentile, meaning x% of observations are ≤ the plotted value.
+
+    Args:
+        graphs_dict: Dictionary mapping string labels to NetworkX graphs. Each edge must have attribute 'load' (float).
+        percentiles: List of percentiles to compute (default: [10, 25, 50, 75, 90, 95, 99]).
+        title: Plot title.
+        use_log_y: Whether to use log scale on y-axis (recommended when values span orders of magnitude).
+        include_zeros: Whether to include zero loads in the calculation.
+        connect_points: Whether to connect percentile points with lines.
+        label_points: Whether to label each point with its percentile and value.
+        save_dir/filename: If set, save plot to disk. Otherwise show.
+    """
+    if not graphs_dict:
+        print("No graphs provided.")
+        return
+    
+    if percentiles is None:
+        percentiles = [10, 25, 50, 75, 90, 95, 99]
+    
+    percentiles = sorted(percentiles)
+    
+    plt.figure(figsize=(12, 7))
+    
+    # Use a colormap to generate distinct colors for each graph
+    num_graphs = len(graphs_dict)
+    colors = plt.cm.tab10(np.linspace(0, 1, num_graphs)) if num_graphs <= 10 else plt.cm.tab20(np.linspace(0, 1, num_graphs))
+    
+    # Markers for distinguishing lines
+    markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
+    
+    # Offset for label positioning to avoid overlap
+    label_offsets = [(-5, 10), (5, 10), (-5, -15), (5, -15), (0, 15), (0, -20)]
+    
+    for idx, (label, G) in enumerate(graphs_dict.items()):
+        loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+
+        if not include_zeros:
+            loads = loads[loads > 0]
+
+        if loads.size == 0:
+            print(f"Graph '{label}' has no loads to plot (empty or all zero).")
+            continue
+
+        # Compute percentile values
+        percentile_values = np.percentile(loads, percentiles)
+        
+        marker = markers[idx % len(markers)]
+        color = colors[idx]
+        
+        if connect_points:
+            plt.plot(percentiles, percentile_values, color=color, label=label, linewidth=2,
+                     marker=marker, markersize=8)
+        else:
+            plt.scatter(percentiles, percentile_values, color=color, label=label, 
+                        marker=marker, s=80)
+        
+        # Label each point with percentile and value
+        if label_points:
+            offset = label_offsets[idx % len(label_offsets)]
+            for p, v in zip(percentiles, percentile_values):
+                # Format value nicely
+                if v == 0:
+                    val_str = "0"
+                elif v >= 1e6:
+                    val_str = f"{v:.2e}"
+                elif v >= 1000:
+                    val_str = f"{v/1000:.1f}K"
+                elif v >= 1:
+                    val_str = f"{v:.1f}"
+                else:
+                    val_str = f"{v:.2e}"
+                plt.annotate(f"P{int(p)}:{val_str}", (p, v), 
+                             textcoords="offset points", xytext=offset,
+                             fontsize=7, color=color, alpha=0.8)
+
+    plt.xlabel("Percentile (%)")
+    plt.ylabel("Edge load (bytes in matrix window)")
+    plt.title(title)
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.legend(loc='upper left')
+    
+    # Set x-axis ticks to the percentiles
+    plt.xticks(percentiles)
+    plt.xlim(min(percentiles) - 5, max(percentiles) + 5)
+
+    if use_log_y:
+        plt.yscale("log")
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_name = filename if filename is not None else f"{title}.png"
+        plt.savefig(os.path.join(save_dir, out_name), dpi=200, bbox_inches="tight")
+        plt.close()
+    else:
+        plt.show()
     
 
 def plot_edge_load_bucket_hist_multiple(
