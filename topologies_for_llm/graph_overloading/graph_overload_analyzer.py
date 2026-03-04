@@ -323,9 +323,9 @@ def main() -> None:
             chosen,
             workload_type=workload_type,
             root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-            switch_ports=64,
+            switch_ports=128,
             down_ports=None,
-            router_ports=64,
+            router_ports=128,
             endpoints_per_router=8,
             inter_group_variant="medium",
         )

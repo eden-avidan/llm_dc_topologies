@@ -19,31 +19,39 @@ from output_config import get_variant_paths
 parser = argparse.ArgumentParser(description='Analyze topology runtime for SimAI workloads')
 parser.add_argument('--moe-active', action='store_true',
                     help='Use MOE-enabled workload data instead of regular workloads')
+parser.add_argument('--heatmaps-only', action='store_true',
+                    help='Generate only topology latency heatmaps and skip runtime/dataframe/overhead plots')
 args = parser.parse_args()
 
-# Gather data from the SimAI simulations:
-invalid_dirs = ["workload", "heatmaps", "workload_moe"]
+# Configure variant-specific output paths once, for all run modes
+variant = "moe" if args.moe_active else "standard"
+paths = get_variant_paths(variant)
 
-script_dir = Path(__file__).resolve().parent
-folder = (script_dir / "../simai/final_output").resolve()
-
-# Filter directories based on MOE flag
-if args.moe_active:
-    print("🔬 MOE Mode: Using MOE-enabled workload data")
-    dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name.endswith('_moe')]
-    output_suffix = "_moe"
+if args.heatmaps_only:
+    print("🗺️  Heatmaps-only mode: skipping workload runtime processing")
+    dirs_list = []
 else:
-    print("📊 Standard Mode: Using regular workload data")
-    dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name not in invalid_dirs and not p.name.endswith('_moe')]
-    output_suffix = ""
+    # Gather data from the SimAI simulations:
+    invalid_dirs = ["workload", "heatmaps", "workload_moe"]
 
-if not dirs_list:
-    print(f"❌ No directories found in {folder}")
+    script_dir = Path(__file__).resolve().parent
+    folder = (script_dir / "../simai/final_output").resolve()
+
+    # Filter directories based on MOE flag
     if args.moe_active:
-        print("   Make sure MOE workloads have been processed (run process_moe_workloads.py)")
-    exit(1)
+        print("🔬 MOE Mode: Using MOE-enabled workload data")
+        dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name.endswith('_moe')]
+    else:
+        print("📊 Standard Mode: Using regular workload data")
+        dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name not in invalid_dirs and not p.name.endswith('_moe')]
 
-print(f"Found {len(dirs_list)} directories to process: {[d.name for d in dirs_list]}")
+    if not dirs_list:
+        print(f"❌ No directories found in {folder}")
+        if args.moe_active:
+            print("   Make sure MOE workloads have been processed (run process_moe_workloads.py)")
+        exit(1)
+
+    print(f"Found {len(dirs_list)} directories to process: {[d.name for d in dirs_list]}")
 
 files_list = [] #sorted([f for f in dirs_list[0].iterdir() if f.is_file() and '.csv' in os.path.basename(f)])
     
@@ -151,22 +159,28 @@ def dragonFlyP_latency(i_location, j_location):
     else:
         return 3 * T_link
 
-
-# def HyperX_latency(i_location, j_location):
-#     if i_location == j_location:
-#         return 0
-#     else:
-#         return 1 * T_link
-
-#%% old functions
-
-def HyperX_latency(i_location, j_location):
+def HyperX_latency_8_nodes_under_switch(i_location, j_location):
     
     if (i_location == j_location):
         return 0
     i_HyperX_loc = location_to_HyperX_location(i_location)
     j_HyperX_loc = location_to_HyperX_location(j_location)
-    result = 0
+    result = 1
+    if i_HyperX_loc.GPU_index != j_HyperX_loc.GPU_index:
+        result = result+1
+    if i_HyperX_loc.HBI_index_1 != j_HyperX_loc.HBI_index_1:
+        result = result+2
+    if i_HyperX_loc.HBI_index_2 != j_HyperX_loc.HBI_index_2:
+        result = result+1
+    return result
+
+def HyperX_latency_1_nodes_under_switch(i_location, j_location):
+    
+    if (i_location == j_location):
+        return 0
+    i_HyperX_loc = location_to_HyperX_location(i_location)
+    j_HyperX_loc = location_to_HyperX_location(j_location)
+    result = 2
     if i_HyperX_loc.GPU_index != j_HyperX_loc.GPU_index:
         result = result+1
     if i_HyperX_loc.HBI_index_1 != j_HyperX_loc.HBI_index_1:
@@ -174,29 +188,7 @@ def HyperX_latency(i_location, j_location):
     if i_HyperX_loc.HBI_index_2 != j_HyperX_loc.HBI_index_2:
         result = result+1
     return result
-    # dist_dim1 = abs(i_HyperX_loc.GPU_index - j_HyperX_loc.GPU_index)
-    # dist_dim1 = min(dist_dim1, GPUs_num-dist_dim1)
-    # dist_dim2 = abs(i_HyperX_loc.HBI_index_1 - j_HyperX_loc.HBI_index_1)
-    # dist_dim2 = min(dist_dim2, (GPUs_num / (N_hbi*N_nodes_1dim)) - dist_dim2)
-    # dist_dim3 = abs(i_HyperX_loc.HBI_index_2 - j_HyperX_loc.HBI_index_2)
-    # dist_dim3 = min(dist_dim3, N_nodes_1dim - dist_dim3)
-    # if (dist_dim1 + dist_dim2 + dist_dim3) == 1:
-    #     return 1
-    # else:
-    #     return None
 
-
-# def HyperX_latency_old(i_location, j_location, N_hbi = N_hbi, N_nodes_1dim = N_nodes_1dim):
-#     if i_location == j_location:
-#         return 0
-#     elif i_location.HBI_index == j_location.HBI_index:
-#         return 2 * T_link_in
-#     i_HyperX_loc = location_to_HyperX_location(i_location)
-#     j_HyperX_loc = location_to_HyperX_location(j_location)
-#     if i_HyperX_loc.HBI_index_1 == j_HyperX_loc.HBI_index_1 or i_HyperX_loc.HBI_index_2 == j_HyperX_loc.HBI_index_2:
-#         return 3 * T_link_out
-#     else:
-#         return 4 * T_link_out
 
 
 #%% Topologies:
@@ -209,8 +201,9 @@ class Topology_Data:
 
 topologies_dict = {"fat tree": Topology_Data(Fat_Tree_latency, None),
                       "rail only": Topology_Data(Rail_Only_latency, None),
-                      "HyperX": Topology_Data(HyperX_latency, None),
-                      "DragonFly+": Topology_Data(dragonFlyP_latency, None)
+                      "HyperX_1": Topology_Data(HyperX_latency_1_nodes_under_switch, None),
+                      "DragonFly+": Topology_Data(dragonFlyP_latency, None),
+                      "HyperX_8": Topology_Data(HyperX_latency_8_nodes_under_switch, None)
                       }
 
 TP_Runtimes_Table = []
@@ -235,8 +228,9 @@ def update_Runtimes_Table(table, file_name):
         "file": file_name[:-4], # without ".csv"
         "fat tree": topologies_dict["fat tree"].last_runtime,
         "rail only": topologies_dict["rail only"].last_runtime,
-        "HyperX": topologies_dict["HyperX"].last_runtime,
-        "DragonFly+": topologies_dict["DragonFly+"].last_runtime
+        "HyperX_1": topologies_dict["HyperX_1"].last_runtime,
+        "DragonFly+": topologies_dict["DragonFly+"].last_runtime,
+        "HyperX_8": topologies_dict["HyperX_8"].last_runtime
     })
 
 # latency_functions = {"fat tree": Fat_Tree_latency,
@@ -262,126 +256,125 @@ def Topology_Runtime(topology, matrix):
     return result
 
 
-for directory in dirs_list:
-    files_list = sorted([f for f in directory.iterdir() if f.is_file() and '.csv' in os.path.basename(f)])
-    for file_index in range(len(files_list)):
-        print (f"martix {file_index} from {len(files_list)} in dir {directory.name}:")
-        print (f"Transport matrix from the file: {os.path.basename(files_list[file_index])}")
-        # save_heatmap(file_index) # heatmaps are already saved in simai.
-        GPUs_num = len(get_matrix(file_index))
-        N_hbi = get_N_hbi(file_index)
-        N_nodes_1dim = int((GPUs_num/N_hbi)**0.5)+1
-        if N_hbi == None:
-            print ("Error in get_N_hbi: The name of the file is not contaion \"_tp<i>_\"!")
-            continue
-        
-        for topology in topologies_dict.keys():
-            topologies_dict[topology].last_runtime = Topology_Runtime(topology, get_matrix(file_index))
-            print (topology, "runtime is: ", topologies_dict[topology].last_runtime)
+if not args.heatmaps_only:
+    for directory in dirs_list:
+        files_list = sorted([f for f in directory.iterdir() if f.is_file() and '.csv' in os.path.basename(f)])
+        for file_index in range(len(files_list)):
+            print (f"martix {file_index} from {len(files_list)} in dir {directory.name}:")
+            print (f"Transport matrix from the file: {os.path.basename(files_list[file_index])}")
+            # save_heatmap(file_index) # heatmaps are already saved in simai.
+            GPUs_num = len(get_matrix(file_index))
+            N_hbi = get_N_hbi(file_index)
+            N_nodes_1dim = int((GPUs_num/N_hbi)**0.5)+1
+            if N_hbi == None:
+                print ("Error in get_N_hbi: The name of the file is not contaion \"_tp<i>_\"!")
+                continue
             
-        update_Runtimes_Table(tables_dict[directory.name], os.path.basename(files_list[file_index]))
-        print()
-#%% arrange the data
+            for topology in topologies_dict.keys():
+                topologies_dict[topology].last_runtime = Topology_Runtime(topology, get_matrix(file_index))
+                print (topology, "runtime is: ", topologies_dict[topology].last_runtime)
+                
+            update_Runtimes_Table(tables_dict[directory.name], os.path.basename(files_list[file_index]))
+            print()
+    #%% arrange the data
 
-Runtime_dfs = {name: pd.DataFrame(table) for name, table in tables_dict.items()}
-# total_runtime_df = sum(Runtime_dfs.values())
-dfs_list = list(Runtime_dfs.values())
-total_runtime_df = dfs_list[0].copy()
+    Runtime_dfs = {name: pd.DataFrame(table) for name, table in tables_dict.items()}
+    # total_runtime_df = sum(Runtime_dfs.values())
+    dfs_list = list(Runtime_dfs.values())
+    total_runtime_df = dfs_list[0].copy()
 
-for df in dfs_list[1:]:
-    for col in total_runtime_df.columns:
-        if total_runtime_df[col].dtype != "object":  # רק עמודות מספריות
-            total_runtime_df[col] += df[col]
+    for df in dfs_list[1:]:
+        for col in total_runtime_df.columns:
+            if total_runtime_df[col].dtype != "object":  # רק עמודות מספריות
+                total_runtime_df[col] += df[col]
 
-# Add Total with appropriate key
-if args.moe_active:
-    Runtime_dfs["Total_moe"] = total_runtime_df
-else:
-    Runtime_dfs["Total"] = total_runtime_df
-
-# for df in Runtime_dfs.values():
-    # df = df.sort_values(by="fat tree")
-    
-# Runtime_df = pd.DataFrame(Runtimes_Table)
-# Runtime_df = Runtime_df.sort_values(by="fat tree")
-#print (Runtime_df)
-
-#%% save the DataFrames
-
-variant = "moe" if args.moe_active else "standard"
-paths = get_variant_paths(variant)
-save_dir = str(paths["dataframes"])
-os.makedirs(save_dir, exist_ok=True)
-
-print(f"\n💾 Saving DataFrames to: {save_dir}/")
-for name, df in Runtime_dfs.items():
-    # Remove _moe suffix from pickle filename for consistency
-    clean_name = name.replace('_moe', '')
-    df.to_pickle(f"{save_dir}/{clean_name}.pkl")
-    print(f"   Saved: {clean_name}.pkl ({len(df)} workloads)")
-
-#%% read the DataFrames
-
-import pandas as pd
-
-loaded_dfs = {}
-for filename in os.listdir(save_dir):
-    if filename.endswith(".pkl"):
-        name = filename[:-4]  # without ".pkl"
-        loaded_dfs[name] = pd.read_pickle(f"{save_dir}/{filename}")
-
-
-#%% Plot the results:
-# labels = Runtime_df["file"]
-# fat = Runtime_df["fat tree"]
-# rail = Runtime_df["rail only"]
-# hyperx = Runtime_df["HyperX"]
-
-# x_axis_loc = np.arange(len(labels))
-# width = 0.2
-
-# fig, ax = plt.subplots(figsize=(10, 6), dpi = 300)
-
-# rects1 = ax.bar(x_axis_loc - width, fat, width, label="Fat Tree")
-# rects2 = ax.bar(x_axis_loc, rail, width, label="Rail Only")
-# rects3 = ax.bar(x_axis_loc + width, hyperx, width, label="HyperX")
-
-# ax.set_ylabel("Runtime")
-# ax.set_xlabel("File Name")
-# ax.set_title("Runtime Comparison Across Topologies")
-# ax.set_xticks(x_axis_loc)
-# ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
-
-plots_dir = str(paths["plots_overhead"])
-os.makedirs(plots_dir, exist_ok=True)
-
-print(f"\n📊 Generating plots in: {plots_dir}/")
-for name, df in Runtime_dfs.items():
-    plt.figure(dpi = 500)
-    # plt.plot(df["file"], df["fat tree"], "o", label="Fat Tree", color="#2ca02c", ms=7)
-    # plt.plot(df["file"], df["rail only"], "o", label="Rail Only", color="gold", ms=5)
-    # plt.plot(df["file"], df["DragonFly+"], "o", label="DragonFly+", color="#d62728", ms=3)
-    plt.plot(df["file"], df["HyperX"], "o", label="HyperX", color="#1f77b4", ms=1)
-
-    plt.xlabel("Transport Matrix")
-    plt.ylabel("Overhead Communication")
-    title = f"Overhead Communication of Topologie - {name}"
+    # Add Total with appropriate key
     if args.moe_active:
-        title += " (MOE)"
-    plt.title(title)
-    plt.legend()
-    plt.grid(True, axis="y")
-    plt.tight_layout()
-    plt.xticks([])
+        Runtime_dfs["Total_moe"] = total_runtime_df
+    else:
+        Runtime_dfs["Total"] = total_runtime_df
 
-    safe_title = re.sub(r'[\\/*?:"<>|]', "_", plt.gca().get_title())
-    filename = f"{plots_dir}/{safe_title}.png"
-    # title = plt.gca().get_title()
-    # filename = f"plots/Overhead_Communication_of_Topologie_{name}.png"
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
-    plt.show()
-    plt.close()
-    print(f"   Saved: {safe_title}.png")
+    # for df in Runtime_dfs.values():
+        # df = df.sort_values(by="fat tree")
+        
+    # Runtime_df = pd.DataFrame(Runtimes_Table)
+    # Runtime_df = Runtime_df.sort_values(by="fat tree")
+    #print (Runtime_df)
+
+    #%% save the DataFrames
+
+    save_dir = str(paths["dataframes"])
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f"\n💾 Saving DataFrames to: {save_dir}/")
+    for name, df in Runtime_dfs.items():
+        # Remove _moe suffix from pickle filename for consistency
+        clean_name = name.replace('_moe', '')
+        df.to_pickle(f"{save_dir}/{clean_name}.pkl")
+        print(f"   Saved: {clean_name}.pkl ({len(df)} workloads)")
+
+    #%% read the DataFrames
+
+    import pandas as pd
+
+    loaded_dfs = {}
+    for filename in os.listdir(save_dir):
+        if filename.endswith(".pkl"):
+            name = filename[:-4]  # without ".pkl"
+            loaded_dfs[name] = pd.read_pickle(f"{save_dir}/{filename}")
+
+
+    #%% Plot the results:
+    # labels = Runtime_df["file"]
+    # fat = Runtime_df["fat tree"]
+    # rail = Runtime_df["rail only"]
+    # hyperx = Runtime_df["HyperX"]
+
+    # x_axis_loc = np.arange(len(labels))
+    # width = 0.2
+
+    # fig, ax = plt.subplots(figsize=(10, 6), dpi = 300)
+
+    # rects1 = ax.bar(x_axis_loc - width, fat, width, label="Fat Tree")
+    # rects2 = ax.bar(x_axis_loc, rail, width, label="Rail Only")
+    # rects3 = ax.bar(x_axis_loc + width, hyperx, width, label="HyperX")
+
+    # ax.set_ylabel("Runtime")
+    # ax.set_xlabel("File Name")
+    # ax.set_title("Runtime Comparison Across Topologies")
+    # ax.set_xticks(x_axis_loc)
+    # ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+
+    plots_dir = str(paths["plots_overhead"])
+    os.makedirs(plots_dir, exist_ok=True)
+
+    print(f"\n📊 Generating plots in: {plots_dir}/")
+    for name, df in Runtime_dfs.items():
+        plt.figure(dpi = 500)
+        # plt.plot(df["file"], df["fat tree"], "o", label="Fat Tree", color="#2ca02c", ms=7)
+        # plt.plot(df["file"], df["rail only"], "o", label="Rail Only", color="gold", ms=5)
+        # plt.plot(df["file"], df["DragonFly+"], "o", label="DragonFly+", color="#d62728", ms=3)
+        plt.plot(df["file"], df["HyperX"], "o", label="HyperX", color="#1f77b4", ms=1)
+
+        plt.xlabel("Transport Matrix")
+        plt.ylabel("Overhead Communication")
+        title = f"Overhead Communication of Topologie - {name}"
+        if args.moe_active:
+            title += " (MOE)"
+        plt.title(title)
+        plt.legend()
+        plt.grid(True, axis="y")
+        plt.tight_layout()
+        plt.xticks([])
+
+        safe_title = re.sub(r'[\\/*?:"<>|]', "_", plt.gca().get_title())
+        filename = f"{plots_dir}/{safe_title}.png"
+        # title = plt.gca().get_title()
+        # filename = f"plots/Overhead_Communication_of_Topologie_{name}.png"
+        plt.savefig(filename, dpi=300, bbox_inches="tight")
+        plt.show()
+        plt.close()
+        print(f"   Saved: {safe_title}.png")
 
 #%%
 
@@ -432,7 +425,7 @@ print(f"\n🗺️  Generating heatmaps in: {output_dir}/")
 for topo_name, matrix in dist_matrices.items():
     plt.figure(figsize=(10, 8))
 
-    discrete_values = [0, 1, 2, 3, 4]
+    discrete_values = [0, 1, 2, 3, 4, 5]
 
                 # צבעים מתוך viridis, לפי מספר הערכים
     cmap = ListedColormap(plt.cm.viridis(np.linspace(0, 1, len(discrete_values))))
@@ -454,7 +447,7 @@ for topo_name, matrix in dist_matrices.items():
         linecolor=None
         )
     cbar = plt.gca().collections[0].colorbar
-    cbar.set_ticks(discrete_values)           # [0,1,2,3]
+    cbar.set_ticks(discrete_values)           # [0,1,2,3,4,5]
     cbar.set_ticklabels(discrete_values) 
 
     plt.title(f"{topo_name} – Latency Heatmap", fontsize=14)
