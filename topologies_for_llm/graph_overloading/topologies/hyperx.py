@@ -11,34 +11,24 @@ from .abstract_topology import Topology, TopologyBuildResult
 
 class HyperX(Topology):
     """
-    Port-limited HyperX topology.
+    HyperX topology (classic complete connectivity per dimension), with direct GPU-GPU links
+    within each router/HBI group.
+
+    Structure:
+      - endpoints_per_router GPUs are connected to each router
+      - GPUs within the same router have direct links (full mesh)
+      - Routers are connected in a HyperX pattern (complete graph per dimension)
+
+    Distance model:
+      - Same router (consecutive endpoints_per_router GPUs): 1 hop (direct GPU-GPU link)
+      - Different routers: (number of differing dimensions) + 2 hops
+        - e.g., differ in 1 dim: GPU → Router1 → Router2 → GPU = 3 hops
+        - e.g., differ in 2 dims: GPU → R1 → R2 → R3 → GPU = 4 hops
+        - e.g., differ in 3 dims: GPU → R1 → R2 → R3 → R4 → GPU = 5 hops
 
     Model:
-      - Endpoints (GPUs) are nodes [0..num_nodes-1]
-      - Routers are additional nodes [num_nodes .. num_nodes + R - 1]
-
-    HyperX parameters:
-      - dims: tuple of dimension sizes (S1, S2, ..., SD) such that
-              R = product(Sd) routers.
-      - endpoints_per_router: p
-      - connect_all_in_dimension: if True, in each dimension, routers form a clique
-        within each "slice" (classic HyperX complete connectivity per dimension).
-        If False, you can later add k-nearest / stride variants (not implemented here).
-
-    Port budget per router:
-      p + degree_interconnect <= router_ports
-
-    Where (for connect_all_in_dimension=True):
-      degree_interconnect = sum_d (Sd - 1)
-
-    Sizing behavior:
-      - If dims is None, we auto-choose a factorization close to a cube (D=3 by default)
-        that yields enough routers to host all endpoints given p.
-      - If dims is provided but too small to host num_nodes endpoints, we raise.
-
-    Notes:
-      - This builds a directed graph with bidirectional physical links (2 directed edges per link).
-      - Routing weights are uniform by default (weight=link_weight).
+      - Endpoints (GPUs): nodes [0..num_nodes-1]
+      - Routers (HBIs): nodes [num_nodes .. num_nodes + R - 1]
     """
 
     def __init__(
@@ -51,7 +41,7 @@ class HyperX(Topology):
         connect_all_in_dimension: bool = True,
         link_capacity: float = 1.0,
         link_weight: float = 1.0,
-        auto_dims_D: int = 3,  # used only if dims is None
+        auto_dims_D: int = 3,
     ) -> None:
         super().__init__(num_nodes)
 
@@ -94,10 +84,6 @@ class HyperX(Topology):
 
     @staticmethod
     def _balanced_dims(target_routers: int, D: int) -> Tuple[int, ...]:
-        """
-        Heuristic: factor target_routers into D dimensions as balanced as possible.
-        We do this by distributing prime factors to the currently smallest dimension.
-        """
         dims = [1] * D
         for p in sorted(HyperX._prime_factors(target_routers), reverse=True):
             i = int(np.argmin(dims))
@@ -107,17 +93,12 @@ class HyperX(Topology):
 
     def _auto_choose_dims(self, needed_routers: int) -> Tuple[int, ...]:
         """
-        Choose dims with product >= needed_routers by picking a balanced factorization
-        of some R >= needed_routers. We choose the smallest R >= needed_routers that
-        is easy to factor (simple increment search).
+        Autoselect dims (shape) given needed router count.
+
+        Uses balanced factorization to distribute routers across D dimensions
+        as evenly as possible.
         """
-        R = max(1, int(needed_routers))
-        # Find a nearby R that factors nicely (small search window)
-        for candidate in range(R, R + 512):
-            dims = self._balanced_dims(candidate, self.auto_dims_D)
-            if np.prod(dims) == candidate:
-                return dims
-        # Fallback: just use the exact needed_routers factorization (even if skewed)
+        R = int(max(1, needed_routers))
         return self._balanced_dims(R, self.auto_dims_D)
 
     def build_topology(self) -> TopologyBuildResult:
@@ -125,7 +106,6 @@ class HyperX(Topology):
         P = self.router_ports
         p = self.p
 
-        # Minimum routers required to host endpoints
         routers_min = int(np.ceil(n / p))
 
         dims = self.dims if self.dims is not None else self._auto_choose_dims(routers_min)
@@ -140,51 +120,63 @@ class HyperX(Topology):
         if not self.connect_all_in_dimension:
             raise NotImplementedError("Only connect_all_in_dimension=True is implemented.")
 
-        # Degree (router-router) for full connectivity per dimension
+        # Degree for classic HyperX with K=1
         degree_inter = int(sum((s - 1) for s in dims))
 
-        # Port constraint: p endpoints + interconnect degree <= P
         if p + degree_inter > P:
             raise ValueError(
-                f"Port constraint violated: endpoints_per_router + sum(Sd-1) = {p} + {degree_inter} = {p+degree_inter} > {P}. "
-                "Reduce dims sizes, reduce endpoints_per_router, or increase router_ports."
+                f"Port constraint violated: {p} + sum(Sd-1)={degree_inter} => {p + degree_inter} > {P}. "
+                "Reduce dims, reduce endpoints_per_router, or increase router_ports."
             )
 
-        # Node IDs
-        gpu_ids = np.arange(0, n, dtype=np.int32)
         router_base = n
         router_ids = np.arange(router_base, router_base + R, dtype=np.int32)
         total_nodes = int(router_base + R)
 
-        # Map GPU -> router (contiguous fill over routers)
+        # GPU -> router mapping: contiguous blocks of size p (NO modulo wrap)
+        # This matches your heatmap assumption: each HBI connects exactly 8 GPUs.
         gpu_to_router = np.empty(n, dtype=np.int32)
         for i in range(n):
-            gpu_to_router[i] = int(router_ids[(i // p) % R])
+            ridx = i // p
+            if ridx >= R:
+                raise ValueError(
+                    f"Not enough routers for contiguous mapping: GPU {i} maps to router index {ridx}, "
+                    f"but only {R} routers exist. Increase dims product or reduce endpoints_per_router."
+                )
+            gpu_to_router[i] = int(router_ids[ridx])
 
-        # Coordinate mapping helpers
-        # Linear index -> coordinates and back
-        strides = []
+        # Coordinate helpers for routers 0..R-1 (row-major indexing for shape=dims)
+        strides: List[int] = []
         prod = 1
         for s in reversed(dims):
             strides.append(prod)
             prod *= s
-        strides = list(reversed(strides))  # stride per dimension
+        strides = list(reversed(strides))
 
         def idx_to_coord(idx: int) -> Tuple[int, ...]:
-            coord = []
-            x = idx
-            for s, st in zip(dims, strides):
-                c = (x // st) % s
-                coord.append(int(c))
-            return tuple(coord)
+            return tuple(int((idx // st) % s) for s, st in zip(dims, strides))
 
         def coord_to_idx(coord: Tuple[int, ...]) -> int:
-            x = 0
-            for c, st in zip(coord, strides):
-                x += int(c) * int(st)
-            return int(x)
+            return int(sum(int(c) * int(st) for c, st in zip(coord, strides)))
 
-        # Build edges (bidirectional physical links -> 2 directed edges per undirected)
+        # --- explicit coordinate maps ---
+        router_idx_to_coord: Dict[int, Tuple[int, ...]] = {}
+        router_id_to_coord: Dict[int, Tuple[int, ...]] = {}
+        for ridx in range(R):
+            c = idx_to_coord(ridx)
+            router_idx_to_coord[ridx] = c
+            router_id_to_coord[int(router_base + ridx)] = c
+
+        gpu_id_to_router_idx = np.empty(n, dtype=np.int32)
+        gpu_id_to_coord: Dict[int, Tuple[int, ...]] = {}
+        for gpu in range(n):
+            ridx = gpu // p  # contiguous blocks
+            gpu_id_to_router_idx[gpu] = ridx
+            rc = router_idx_to_coord[ridx]
+            i = gpu % p
+            gpu_id_to_coord[gpu] = (*rc, int(i))  # (x,y,z,i)
+
+
         edges_u: List[int] = []
         edges_v: List[int] = []
 
@@ -192,31 +184,44 @@ class HyperX(Topology):
             edges_u.append(u); edges_v.append(v)
             edges_u.append(v); edges_v.append(u)
 
-        # (1) Endpoint <-> Router
+        # (1) GPU <-> Router
         for gpu in range(n):
             add_bidir(int(gpu), int(gpu_to_router[gpu]))
 
-        # (2) Router-router links:
-        # For each router, for each dimension d, connect to all routers that differ only in coord[d].
-        # To avoid duplicating undirected links, only add if src_idx < dst_idx.
+        # (1b) Direct GPU <-> GPU links within each router group (full mesh)
+        # This creates direct distance-1 links between consecutive endpoints_per_router GPUs
+        for ridx in range(R):
+            base_gpu = ridx * p
+            # Create full mesh within the router group
+            for i in range(p):
+                for j in range(i + 1, p):
+                    gpu_i = base_gpu + i
+                    gpu_j = base_gpu + j
+                    if gpu_i < n and gpu_j < n:
+                        add_bidir(gpu_i, gpu_j)
+
+        # (2) Router-router HyperX links (differ in exactly 1 coordinate)
         undirected = set()
         for src_idx in range(R):
             c = list(idx_to_coord(src_idx))
             src = int(router_base + src_idx)
+
             for d, Sd in enumerate(dims):
-                original = c[d]
+                orig = c[d]
                 for new_val in range(Sd):
-                    if new_val == original:
+                    if new_val == orig:
                         continue
                     c[d] = new_val
                     dst_idx = coord_to_idx(tuple(c))
                     dst = int(router_base + dst_idx)
+
                     key = (min(src, dst), max(src, dst))
                     if key in undirected:
                         continue
                     undirected.add(key)
                     add_bidir(src, dst)
-                c[d] = original  # restore
+
+                c[d] = orig
 
         edges = np.column_stack(
             (np.asarray(edges_u, dtype=np.int32), np.asarray(edges_v, dtype=np.int32))
@@ -226,7 +231,7 @@ class HyperX(Topology):
         weight = np.full((m,), self.link_weight, dtype=np.float32)
 
         meta: Dict[str, Any] = {
-            "topology": "HyperX (port-limited, complete-dimension)",
+            "topology": "HyperX (complete-dimension, with direct GPU-GPU links)",
             "num_endpoints": n,
             "router_ports": P,
             "params": {
@@ -234,6 +239,13 @@ class HyperX(Topology):
                 "routers": R,
                 "endpoints_per_router": p,
                 "connect_all_in_dimension": True,
+            },
+            "distance_model": {
+                "same_router": 1,
+                "differ_1_dim": 3,  # 1 + 2
+                "differ_2_dims": 4,  # 2 + 2
+                "differ_3_dims": 5,  # 3 + 2
+                "formula": "differing_dimensions + 2",
             },
             "port_accounting_per_router": {
                 "endpoint_ports": p,
@@ -245,6 +257,7 @@ class HyperX(Topology):
                 "total_nodes_including_routers": total_nodes,
                 "routers": R,
                 "endpoints": n,
+                "direct_gpu_links_per_router": p * (p - 1) // 2,  # full mesh = C(p,2)
             },
             "node_ranges": {
                 "endpoints": (0, n - 1),
@@ -253,6 +266,13 @@ class HyperX(Topology):
             "gpu_to_router": gpu_to_router,
         }
 
+        meta["coord_maps"] = {
+            "router_idx_to_coord": router_idx_to_coord,
+            "router_id_to_coord": router_id_to_coord,
+            "gpu_id_to_coord": gpu_id_to_coord,
+            "gpu_id_to_router_idx": gpu_id_to_router_idx,
+        }        
+        
         res = TopologyBuildResult(edges=edges, attrs={"capacity": capacity, "weight": weight}, meta=meta)
         self._cached_build = res
         return res

@@ -3,6 +3,7 @@ from collections import defaultdict
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -252,9 +253,8 @@ def plot_edge_load_cdf_multiple(
 
     plt.figure(figsize=(10, 6))
     
-    # Use a colormap to generate distinct colors for each graph
-    num_graphs = len(graphs_dict)
-    colors = plt.cm.tab10(np.linspace(0, 1, num_graphs)) if num_graphs <= 10 else plt.cm.tab20(np.linspace(0, 1, num_graphs))
+    # Use matplotlib's default color cycle (same as histogram)
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     
     # Markers for distinguishing lines
     markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
@@ -305,8 +305,35 @@ def plot_edge_load_cdf_multiple(
             plot_y = np.concatenate([[0, 0], y])
         
         marker = markers[idx % len(markers)]
-        plt.plot(plot_x, plot_y, color=colors[idx], label=label, linewidth=2, 
-                 marker=marker, markersize=5, markevery=max(1, len(plot_x) // 15))
+        color = default_colors[idx % len(default_colors)]
+        
+        # Compute marker indices that are evenly spaced in log-space (for log x-axis)
+        num_markers = 30
+        if use_log_x and len(plot_x) > num_markers:
+            # Filter to positive x values for log spacing
+            positive_mask = plot_x > 0
+            if np.any(positive_mask):
+                log_x = np.log10(np.maximum(plot_x, 1e-12))
+                log_min, log_max = log_x[positive_mask].min(), log_x[positive_mask].max()
+                if log_max > log_min:
+                    # Generate evenly spaced positions in log-space
+                    log_targets = np.linspace(log_min, log_max, num_markers)
+                    # Find nearest data point index for each target
+                    marker_indices = []
+                    for target in log_targets:
+                        idx_nearest = np.argmin(np.abs(log_x - target))
+                        if idx_nearest not in marker_indices:
+                            marker_indices.append(idx_nearest)
+                    markevery = marker_indices
+                else:
+                    markevery = max(1, len(plot_x) // num_markers)
+            else:
+                markevery = max(1, len(plot_x) // num_markers)
+        else:
+            markevery = max(1, len(plot_x) // num_markers)
+        
+        plt.plot(plot_x, plot_y, color=color, label=label, linewidth=2, 
+                 marker=marker, markersize=5, markevery=markevery)
 
     plt.ylabel("Edges with load ≤ x (%)")
     plt.xlabel("Edge load (bytes in matrix window)")
@@ -361,15 +388,14 @@ def plot_edge_load_percentiles_multiple(
         return
     
     if percentiles is None:
-        percentiles = [10, 25, 50, 75, 90, 95, 99]
+        percentiles = [10, 25, 50, 60, 70, 80, 90, 95, 99]
     
     percentiles = sorted(percentiles)
     
     plt.figure(figsize=(12, 7))
     
-    # Use a colormap to generate distinct colors for each graph
-    num_graphs = len(graphs_dict)
-    colors = plt.cm.tab10(np.linspace(0, 1, num_graphs)) if num_graphs <= 10 else plt.cm.tab20(np.linspace(0, 1, num_graphs))
+    # Use matplotlib's default color cycle (same as histogram)
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     
     # Markers for distinguishing lines
     markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
@@ -391,7 +417,7 @@ def plot_edge_load_percentiles_multiple(
         percentile_values = np.percentile(loads, percentiles)
         
         marker = markers[idx % len(markers)]
-        color = colors[idx]
+        color = default_colors[idx % len(default_colors)]
         
         if connect_points:
             plt.plot(percentiles, percentile_values, color=color, label=label, linewidth=2,
@@ -701,10 +727,32 @@ def plot_shortest_path_heatmap(
     
     min_dist = int(np.min(valid_values))
     max_dist = int(np.max(valid_values))
+    # Ensure at least 5 discrete color values
+    min_colors = 7
+    if max_dist - min_dist + 1 < min_colors:
+        max_dist = min_dist + min_colors - 1
     discrete_values = list(range(min_dist, max_dist + 1))
     
-    # Create discrete colormap using viridis
-    cmap = ListedColormap(plt.cm.viridis(np.linspace(0, 1, len(discrete_values))))
+    # Create discrete colormap: cold (low) to warm (high)
+    # 7-color scale from deep blue to dark red
+    cold_to_warm = [
+        '#313695',  # deep navy (coldest / strongest negative)
+        '#74add1',  # distinct mid-blue
+        '#e0f3f8',  # pale icy blue (near zero)
+        '#fee090',  # pale warm yellow (near zero)
+        '#f46d43',  # vibrant orange-red
+        '#a50026',  # deep crimson (warmest / strongest positive)
+    ]
+    # Select colors based on number of discrete values needed
+    num_colors = len(discrete_values)
+    if num_colors <= len(cold_to_warm):
+        # Pick evenly spaced colors from our palette
+        indices = np.linspace(0, len(cold_to_warm) - 1, num_colors).astype(int)
+        colors = [cold_to_warm[i] for i in indices]
+    else:
+        # Fall back to coolwarm colormap for more colors
+        colors = plt.cm.coolwarm(np.linspace(0, 1, num_colors))
+    cmap = ListedColormap(colors)
     
     # Boundaries for discrete colors
     bounds = np.arange(len(discrete_values) + 1) - 0.5 + min_dist
@@ -758,6 +806,13 @@ def plot_shortest_path_heatmap(
         out_name = filename if filename is not None else f"{title.replace(' ', '_')}.png"
         plt.savefig(os.path.join(save_dir, out_name), dpi=dpi, bbox_inches="tight")
         plt.close()
+        
+        # Save as CSV with GPU/node indices
+        csv_name = out_name.replace(".png", ".csv")
+        gpu_labels = [f"GPU{node}" for node in node_order]
+        df_heatmap = pd.DataFrame(dist_matrix, index=gpu_labels, columns=gpu_labels)
+        df_heatmap.to_csv(os.path.join(save_dir, csv_name))
+        print(f"📄 Saved CSV: {os.path.join(save_dir, csv_name)}")
     else:
         plt.show()
 

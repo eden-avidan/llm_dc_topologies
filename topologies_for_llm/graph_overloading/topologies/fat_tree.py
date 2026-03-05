@@ -14,13 +14,20 @@ def _is_power_of_two(x: int) -> bool:
 
 class FatTree(Topology):
     """
-    Radix-128 fabric with explicit 8-GPU HBI hubs AND explicit leaf-class hubs.
+    Radix-128 fabric with explicit 8-GPU HBI hubs, direct GPU-GPU links, AND explicit leaf-class hubs.
 
     Requirements implemented:
-      - HBI distance is 2: GPU_a -> HBI -> GPU_b (same HBI)
+      - HBI direct links: GPU_a -> GPU_b (same HBI) = 1 hop (full mesh within each 8-GPU group)
+      - HBI via hub: GPU_a -> HBI -> GPU_b = 2 hops (alternative path)
       - Leaf-class distance is 2: GPU_i -> Leaf(offset=i%8) -> GPU_{i+8k} (within same pod)
       - Leaves connect through spines (within pod): GPU -> Leaf -> Spine -> Leaf -> GPU (<=4 in one pod)
       - Spines connect through super-spines when multiple pods exist (cross-pod paths become >=6)
+
+    Distance model:
+      - Same HBI group (consecutive 8 GPUs): 1 hop (direct GPU-GPU link)
+      - Same pod, different HBI, same leaf class: 2 hops (GPU -> Leaf -> GPU)
+      - Same pod, different leaf class: 4 hops (GPU -> Leaf -> Spine -> Leaf -> GPU)
+      - Different pods: 6+ hops (via super-spines)
 
     Notes:
       - This is a port-limited model for switches (leaf/spine/super): each has <=128 incident links.
@@ -146,12 +153,24 @@ class FatTree(Topology):
             edges_u.append(u); edges_v.append(v)
             edges_u.append(v); edges_v.append(u)
 
-        # (1) GPU <-> HBI hub (distance-2 inside HBI)
+        # (1) GPU <-> HBI hub (distance-2 inside HBI via hub)
         gpu_to_hbi = np.empty(n_gpus, dtype=np.int32)
         for g in range(n_gpus):
             hid = int(hbi_ids[g // H])
             gpu_to_hbi[g] = hid
             add_bidir(int(g), hid)
+
+        # (1b) Direct GPU <-> GPU links within each HBI group (full mesh)
+        # This creates direct distance-1 links between consecutive 8 GPUs
+        for hbi_idx in range(num_hbis):
+            base_gpu = hbi_idx * H
+            # Create full mesh within the HBI group
+            for i in range(H):
+                for j in range(i + 1, H):
+                    gpu_i = base_gpu + i
+                    gpu_j = base_gpu + j
+                    if gpu_i < n_gpus and gpu_j < n_gpus:
+                        add_bidir(gpu_i, gpu_j)
 
         # (2) GPU <-> Leaf (stride-8 leaf rule inside each pod)
         # Leaf index in pod = (local_gpu_index % 8)
@@ -203,6 +222,12 @@ class FatTree(Topology):
             "leaves_per_pod": L,
             "spines_per_pod": spines_per_pod,
             "leaf_rule": "GPU g connects to leaf ( (g % pod_size) % 8 ) within its pod",
+            "distance_model": {
+                "same_hbi_group": 1,
+                "same_pod_same_leaf_class": 2,
+                "same_pod_different_leaf_class": 4,
+                "different_pods": 6,
+            },
             "port_splits": {
                 "leaf": {"downlinks_to_gpus": leaf_down, "uplinks_to_spines": self.leaf_uplinks, "total": leaf_down + self.leaf_uplinks},
                 "spine": {"south_to_leaves": spine_south, "north_to_super": (spine_north if num_pods > 1 else 0), "total": spine_south + (spine_north if num_pods > 1 else 0)},
@@ -212,6 +237,7 @@ class FatTree(Topology):
             "counts": {
                 "total_nodes_including_hbi_and_switches": total_nodes,
                 "super_spines": int(super_spine_ids.size),
+                "direct_gpu_links_per_hbi": H * (H - 1) // 2,  # full mesh = C(8,2) = 28 per group
             },
             "ids": {
                 "hbi_ids": hbi_ids,

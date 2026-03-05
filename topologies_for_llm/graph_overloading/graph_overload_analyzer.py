@@ -187,7 +187,7 @@ def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, r
 
     plot_edge_load_cdf(
         G,
-        title=f"DragonflyPlus edge-load CDF - {workload_name}",
+        title=f"Dragonfly+ edge-load CDF - {workload_name}",
         use_log_x=True,
         include_zeros=True,
     )
@@ -211,15 +211,38 @@ def create_all_topologies_and_graphs(
 
     base_graphs = {
         "Fat Tree": FatTree(num_nodes=n).convert_to_networkx(),
-        "HyperX": HyperX(num_nodes=n, router_ports=router_ports, endpoints_per_router=endpoints_per_router,
-                         link_capacity=1.0, link_weight=1.0).convert_to_networkx(),
+        "HyperX": HyperX(
+            num_nodes=n,
+            router_ports=router_ports,
+            endpoints_per_router=8,
+            # dims computed automatically based on num_nodes and endpoints_per_router
+            link_capacity=1.0,
+            link_weight=1.0,
+        ).convert_to_networkx(),
+        # "HyperX_1": HyperX(
+        #     num_nodes=n,
+        #     router_ports=router_ports,
+        #     endpoints_per_router=1,
+        #     # dims computed automatically based on num_nodes and endpoints_per_router
+        #     link_capacity=1.0,
+        #     link_weight=1.0,
+        # ).convert_to_networkx(),
         "Dragonfly+": DragonflyPlus(
             num_nodes=n,
             router_ports=router_ports,
+            gpus_per_leaf=8,
             inter_group_variant=inter_group_variant,
             link_capacity=1.0,
             link_weight=1.0
-        ).convert_to_networkx(),
+        ).convert_to_networkx()#,
+        # "DragonflyPlus_1": DragonflyPlus(
+        #     num_nodes=n,
+        #     router_ports=router_ports,
+        #     gpus_per_leaf=1,
+        #     inter_group_variant=inter_group_variant,
+        #     link_capacity=1.0,
+        #     link_weight=1.0
+        # ).convert_to_networkx()
     }
 
     variants = [
@@ -238,39 +261,50 @@ def create_all_topologies_and_graphs(
             annotate_graph_with_loads(G, edge_load, capacity=None)
             graphs_variant[topo_name] = G
 
-        # heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
+        heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
         for topo_name, graph in graphs_variant.items():
             plot_shortest_path_heatmap(
                 graph,
                 num_endpoints=n,  # Only show GPU nodes (0 to n-1), matching transport matrix
-                title=f"{topo_name} - Shortest path heatmap - {workload_name}",
+                title=f"{topo_name} latency heatmap (world size={n})",
                 x_label="Target GPU",
                 y_label="Source GPU",
-                # save_dir=heatmap_save_dir,
+                save_dir=heatmap_save_dir,
                 filename=f"{topo_name.replace(' ', '_')}_{workload_name}.png",
             )
-
         save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
+        cdf_dir = str(Path(save_dir) / "cdf")
+        histogram_dir = str(Path(save_dir) / "histogram")
+        percentiles_dir = str(Path(save_dir) / "percentiles")
+        
+        # Create directories if they don't exist
+        os.makedirs(cdf_dir, exist_ok=True)
+        os.makedirs(histogram_dir, exist_ok=True)
+        os.makedirs(percentiles_dir, exist_ok=True)
+        
         plot_edge_load_cdf_multiple(
             graphs_variant,
             title=f"Edge-load CDF - {workload_name} ({variant_dirname})",
             use_log_x=use_log_x,
+            save_dir=save_dir,
             include_zeros=include_zeros,
-            filename=f"{workload_name}.png",   # one file per workload per variant
+            filename=os.path.join(cdf_dir, f"cdf_{workload_name}.png"),
         )
 
         plot_edge_load_bucket_hist_multiple(
             graphs_variant,
             title=f"Edge-load bucket histogram - {workload_name} ({variant_dirname})",
             include_zeros=include_zeros,
-            filename=f"{workload_name}.png",   # one file per workload per variant
+            save_dir=save_dir,
+            filename=os.path.join(histogram_dir, f"histogram_{workload_name}.png"),
         )
 
         plot_edge_load_percentiles_multiple(
             graphs_variant,
             title=f"Edge-load percentiles - {workload_name} ({variant_dirname})",
             include_zeros=include_zeros,
-            filename=f"{workload_name}.png",   # one file per workload per variant
+            save_dir=save_dir,
+            filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
         )
 
 
@@ -292,15 +326,6 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
-        # Choose a workload with world_size=128
-        chosen = next((name for name, M in workloads.items() if M.shape[0] == 128), None)
-        if chosen is None:
-            print("No workload with world_size=128 found, using first available.")
-            chosen = next(iter(workloads.keys()))
-        # run_one_workload_on_fattree(workloads, chosen, switch_ports=64)
-        # run_one_workload_on_hyperx(workloads, chosen, router_ports=64, endpoints_per_router=8)
-        # run_one_workload_on_dragonfly_plus(workloads, chosen, router_ports=64, endpoints_per_router=8, global_links_per_router=8)
-
         # base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
         # total_workloads = len(workloads)
         # for i, workload_name in enumerate(workloads.keys()):
@@ -311,24 +336,30 @@ def main() -> None:
         #         workload_name,
         #         workload_type=workload_type,
         #         root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-        #         switch_ports=64,
+        #         switch_ports=128,
         #         down_ports=None,
-        #         router_ports=64,
+        #         router_ports=128,
         #         endpoints_per_router=8,
         #         inter_group_variant="medium",
         #     )
+        world_sizes = [128, 1024]
+        for i in world_sizes:
+            chosen = next((name for name, M in workloads.items() if M.shape[0] == i), None)
+            if chosen is None:
+                print("No workload with world_size=128 found, using first available.")
+                chosen = next(iter(workloads.keys()))
 
-        create_all_topologies_and_graphs(
-            workloads,
-            chosen,
-            workload_type=workload_type,
-            root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-            switch_ports=128,
-            down_ports=None,
-            router_ports=128,
-            endpoints_per_router=8,
-            inter_group_variant="medium",
-        )
+            create_all_topologies_and_graphs(
+                workloads,
+                chosen,
+                workload_type=workload_type,
+                root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
+                switch_ports=128,
+                down_ports=None,
+                router_ports=128,
+                endpoints_per_router=8,
+                inter_group_variant="medium",
+            )
 
 if __name__ == "__main__":
     main()

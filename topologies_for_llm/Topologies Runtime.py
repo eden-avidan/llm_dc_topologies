@@ -153,11 +153,11 @@ def dragonFlyP_latency(i_location, j_location):
     if i_location == j_location:
         return 0
     elif i_location.HBI_index == j_location.HBI_index:
-        return 2 * T_link_in
+        return 2 * T_link_in + 2
     # elif i_location.GPU_index == j_location.GPU_index:
         # return 3 * T_link
     else:
-        return 3 * T_link
+        return 3 * T_link + 2
 
 def HyperX_latency_8_nodes_under_switch(i_location, j_location):
     
@@ -460,7 +460,14 @@ for topo_name, matrix in dist_matrices.items():
     plt.savefig(filename, dpi=300)
     plt.close()
 
-    print(f"✅ Saved heatmap for {topo_name} → {filename}")    
+    print(f"✅ Saved heatmap for {topo_name} → {filename}")
+    
+    # Save as CSV with GPU indices
+    csv_filename = f"{output_dir}/{topo_name.replace(' ', '_')}_heatmap.csv"
+    gpu_labels = [f"GPU{i}" for i in range(GPUs_num)]
+    df_heatmap = pd.DataFrame(matrix, index=gpu_labels, columns=gpu_labels)
+    df_heatmap.to_csv(csv_filename)
+    print(f"📄 Saved CSV for {topo_name} → {csv_filename}")    
     
 for topo_name, statistic in statistic_dict.items():
     print(topo_name)
