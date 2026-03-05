@@ -229,8 +229,6 @@ def minimal_balanced_3d_dims(num_gpus: int, gpus_per_hbi: int = 8):
 
     return best[3]
 
-    return best_dims
-
 @dataclass(frozen=True)
 class HyperXGPUPlacement:
     """
@@ -252,8 +250,8 @@ class HyperXGPUPlacement:
         if not (0 <= hbi_idx < r):
             raise ValueError(f"hbi_idx out of range: {hbi_idx} not in [0, {r-1}]")
 
-        if not (0 <= gpu_in_hbi < 8):
-            raise ValueError(f"gpu_in_hbi must be in [0,7], got {gpu_in_hbi}")
+        # gpu_in_hbi is not used for coordinate calculation - coords are router-only
+        # (validation removed since N_hbi varies per workload)
 
         # Row-major with z fastest: idx = (x*Sy + y)*Sz + z
         x = hbi_idx // (sy * sz)
@@ -264,10 +262,11 @@ class HyperXGPUPlacement:
 
 
 def HyperX_latency_8_nodes_under_switch(i_location, j_location, num_gpus=128):
+    # print(f"i_location: {i_location.HBI_index}, {i_location.GPU_index}")
+    # print(f"j_location: {j_location.HBI_index}, {j_location.GPU_index}")
     hyperx_gpu_placement = HyperXGPUPlacement(dims=minimal_balanced_3d_dims(num_gpus=num_gpus))
-    print(f"HyperX GPU placement: {hyperx_gpu_placement.dims}")
+    # print(f"HyperX GPU placement: {hyperx_gpu_placement.dims}")
     latency = 0
-
     if i_location == j_location:
         # Same GPU
         latency = 0
@@ -281,20 +280,20 @@ def HyperX_latency_8_nodes_under_switch(i_location, j_location, num_gpus=128):
         # print(f"GPU i: ({i_x}, {i_y}, {i_z}) to GPU j: ({j_x}, {j_y}, {j_z}): {latency}")
     return latency
 
-def HyperX_latency_1_nodes_under_switch(i_location, j_location):
+# def HyperX_latency_1_nodes_under_switch(i_location, j_location):
     
-    if (i_location == j_location):
-        return 0
-    i_HyperX_loc = location_to_HyperX_location(i_location)
-    j_HyperX_loc = location_to_HyperX_location(j_location)
-    result = 2
-    if i_HyperX_loc.GPU_index != j_HyperX_loc.GPU_index:
-        result = result+1
-    if i_HyperX_loc.HBI_index_1 != j_HyperX_loc.HBI_index_1:
-        result = result+1
-    if i_HyperX_loc.HBI_index_2 != j_HyperX_loc.HBI_index_2:
-        result = result+1
-    return result
+#     if (i_location == j_location):
+#         return 0
+#     i_HyperX_loc = location_to_HyperX_location(i_location)
+#     j_HyperX_loc = location_to_HyperX_location(j_location)
+#     result = 2
+#     if i_HyperX_loc.GPU_index != j_HyperX_loc.GPU_index:
+#         result = result+1
+#     if i_HyperX_loc.HBI_index_1 != j_HyperX_loc.HBI_index_1:
+#         result = result+1
+#     if i_HyperX_loc.HBI_index_2 != j_HyperX_loc.HBI_index_2:
+#         result = result+1
+#     return result
 
 
 
@@ -308,7 +307,7 @@ class Topology_Data:
 
 topologies_dict = {"fat tree": Topology_Data(Fat_Tree_latency, None),
                       "rail only": Topology_Data(Rail_Only_latency, None),
-                      "HyperX_1": Topology_Data(HyperX_latency_1_nodes_under_switch, None),
+                    #   "HyperX_1": Topology_Data(HyperX_latency_1_nodes_under_switch, None),
                       "DragonFly+": Topology_Data(dragonFlyP_latency, None),
                       "HyperX_8": Topology_Data(HyperX_latency_8_nodes_under_switch, None)
                       }
@@ -335,7 +334,7 @@ def update_Runtimes_Table(table, file_name):
         "file": file_name[:-4], # without ".csv"
         "fat tree": topologies_dict["fat tree"].last_runtime,
         "rail only": topologies_dict["rail only"].last_runtime,
-        "HyperX_1": topologies_dict["HyperX_1"].last_runtime,
+        # "HyperX_1": topologies_dict["HyperX_1"].last_runtime,
         "DragonFly+": topologies_dict["DragonFly+"].last_runtime,
         "HyperX_8": topologies_dict["HyperX_8"].last_runtime
     })
@@ -346,18 +345,19 @@ def update_Runtimes_Table(table, file_name):
 
 #%% Runtime of topologies:
 
-def Topology_Runtime(topology, matrix):
+def Topology_Runtime(topology, matrix, GPUs_num):
     result = 0
     for i in range (len(matrix)):
         for j in range (len(matrix)):
             i_location = index_to_location(i)
             j_location = index_to_location(j)
             if matrix[i][j] != 0:
-                i_j_latency = topologies_dict[topology].latency_function(i_location, j_location)
+                # print(f"i_location: {i_location.HBI_index}, {i_location.GPU_index}")
+                if topology == "HyperX_8":
+                    i_j_latency = topologies_dict[topology].latency_function(i_location, j_location, GPUs_num)
+                else:
+                    i_j_latency = topologies_dict[topology].latency_function(i_location, j_location)
                 if i_j_latency == None:
-                    # print ("i = ", i, "; j = ", j, " ; data = ", matrix[i][j])
-                    # print ("i_location: ", i_location)
-                    # print ("j_location: ", j_location)
                     return None
                 result = result + i_j_latency * matrix[i][j]
     return result
@@ -371,14 +371,14 @@ if not args.heatmaps_only:
             print (f"Transport matrix from the file: {os.path.basename(files_list[file_index])}")
             # save_heatmap(file_index) # heatmaps are already saved in simai.
             GPUs_num = len(get_matrix(file_index))
-            N_hbi = get_N_hbi(file_index)
+            # N_hbi = get_N_hbi(file_index)
             N_nodes_1dim = int((GPUs_num/N_hbi)**0.5)+1
             if N_hbi == None:
                 print ("Error in get_N_hbi: The name of the file is not contaion \"_tp<i>_\"!")
                 continue
             
             for topology in topologies_dict.keys():
-                topologies_dict[topology].last_runtime = Topology_Runtime(topology, get_matrix(file_index))
+                topologies_dict[topology].last_runtime = Topology_Runtime(topology, get_matrix(file_index), GPUs_num)
                 print (topology, "runtime is: ", topologies_dict[topology].last_runtime)
                 
             update_Runtimes_Table(tables_dict[directory.name], os.path.basename(files_list[file_index]))
@@ -509,9 +509,12 @@ for topo_name, topo_data in topologies_dict.items():
     statistic_dict[topo_name] = {}
 
     for i in range(GPUs_num):
-        # print("i = ", i, "location = ", location_to_HyperX_location(index_to_location(i)))
         for j in range(GPUs_num):
-            val = latency_func(index_to_location(i), index_to_location(j))
+            # HyperX_8 needs num_gpus parameter for 3D coordinate calculation
+            if topo_name == "HyperX_8":
+                val = latency_func(index_to_location(i), index_to_location(j), GPUs_num)
+            else:
+                val = latency_func(index_to_location(i), index_to_location(j))
             matrix[i, j] = val
             
             statistic_dict[topo_name][val] = statistic_dict[topo_name].get(val, 0) + 1
