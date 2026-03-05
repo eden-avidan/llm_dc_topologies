@@ -10,6 +10,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 import seaborn as sns
 import math
 import os
+import glob
 
 
 def _is_gpu(node: object, num_endpoints: int) -> bool:
@@ -1093,7 +1094,8 @@ def compute_gpu_to_gpu_delay_df(
             rho = 0.0
         if rho >= 1.0:
             rho = 0.999999
-
+        if rho > 0:
+            print(f"rho: {rho}")
         return 1.0 / (1.0 - rho)
 
     # Iterate non-zeros in OD (CSR assumed)
@@ -1181,3 +1183,94 @@ def compute_gpu_to_gpu_delay_df(
         print(f"📄 Saved delay DataFrame CSV: {out_path}")
 
     return df
+
+def load_and_compare_delay_percentiles(
+    delay_dir: str,
+    *,
+    workload_name: str,
+    percentiles: Tuple[int, ...] = (10, 25, 50, 60, 70, 80, 90, 95, 99),
+) -> pd.DataFrame:
+    """
+    From delay_dir, load all delay CSVs whose filename contains workload_name.
+    For each CSV:
+      - load into a DataFrame
+      - flatten to a 1D ascending array containing only non-zero values
+      - compute min/max/mean/median
+      - compute p% thresholds for all percentiles in `percentiles`
+    Save the combined summary table to CSV in delay_dir and return it as a DataFrame.
+    """
+    delay_dir = os.path.expanduser(str(delay_dir))
+    if not os.path.isdir(delay_dir):
+        raise FileNotFoundError(f"delay_dir does not exist or is not a directory: {delay_dir!r}")
+
+    # Load all delay CSVs that contain workload_name anywhere in the filename
+    # Use *_delay.csv pattern to exclude summary/percentiles files
+    pattern = os.path.join(delay_dir, f"*{workload_name}*_delay.csv")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No delay CSVs found in {delay_dir!r} matching pattern {pattern!r}")
+
+    rows = []
+    qs = np.array(percentiles, dtype=float) / 100.0
+
+    for fp in files:
+        base = os.path.basename(fp)
+
+        # Load
+        df = pd.read_csv(fp, index_col=0)
+        values = df.to_numpy(dtype=float, copy=False)
+
+        # Flatten + keep only non-zero values
+        flat = values.reshape(-1)
+        flat = flat[~np.isnan(flat)]  # defensive: drop NaNs if they exist
+        flat = flat[flat != 0.0]      # keep only non-zero (can change to >0.0 if you guarantee positivity)
+        flat.sort()                   # ascending
+
+        if flat.size == 0:
+            # No non-zero entries, skip (or record NaNs; skipping is usually cleaner)
+            continue
+
+        # Summary stats
+        min_v = float(flat[0])
+        max_v = float(flat[-1])
+        mean_v = float(np.mean(flat))
+        median_v = float(np.median(flat))
+
+        # Percentiles: threshold such that >=p% of samples are <= value
+        # Use empirical quantile with "higher" (returns an observed value)
+        try:
+            pct_vals = np.quantile(flat, qs, method="higher")
+        except TypeError:
+            pct_vals = np.quantile(flat, qs, interpolation="higher")
+
+        row = {
+            "file": base,
+            "num_nonzero": int(flat.size),
+            "min": min_v,
+            "mean": mean_v,
+            "median": median_v,
+            "max": max_v,
+        }
+        for p, v in zip(percentiles, pct_vals):
+            row[f"p{int(p)}"] = float(v)
+
+        rows.append(row)
+
+    if not rows:
+        raise RuntimeError(
+            f"Found {len(files)} CSVs containing {workload_name!r}, but none had any non-zero values."
+        )
+
+    out_df = pd.DataFrame(rows)
+
+    # Sort for easier comparison (by median, then p95, then max if present)
+    sort_cols = [c for c in ("median", "p95", "max") if c in out_df.columns]
+    if sort_cols:
+        out_df = out_df.sort_values(by=sort_cols, ascending=True).reset_index(drop=True)
+
+    # Save summary CSV
+    safe_workload = workload_name.replace(os.sep, "_")
+    out_path = os.path.join(delay_dir, f"delay_summary_{safe_workload}.csv")
+    out_df.to_csv(out_path, index=False)
+
+    return out_df

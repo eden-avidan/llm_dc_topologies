@@ -420,6 +420,34 @@ def plot_hop_distribution(num_gpus: int, n_hbi: int, output_dir: str):
     
     print(f"📊 Saved hop distribution plot → {filename}")
     
+    # Save hop distribution data to CSV
+    csv_rows = []
+    for topo_name, dist in hop_distributions.items():
+        total = sum(dist.values())
+        weighted_sum = sum(h * c for h, c in dist.items())
+        avg_hops = weighted_sum / total if total > 0 else 0
+        
+        row = {
+            "topology": topo_name,
+            "num_gpus": num_gpus,
+            "gpus_per_hbi": n_hbi,
+            "avg_hops": round(avg_hops, 3),
+            "total_pairs": total,
+        }
+        # Add count and percentage for each hop value
+        for h in all_hops:
+            count = dist.get(h, 0)
+            pct = (count / total) * 100 if total > 0 else 0
+            row[f"hops_{h}_count"] = count
+            row[f"hops_{h}_pct"] = round(pct, 2)
+        
+        csv_rows.append(row)
+    
+    csv_df = pd.DataFrame(csv_rows)
+    csv_filename = f"{output_dir}/hop_distribution_{num_gpus}gpus.csv"
+    csv_df.to_csv(csv_filename, index=False)
+    print(f"📄 Saved hop distribution CSV → {csv_filename}")
+    
     # Also print statistics summary
     print(f"\n📈 Hop Distribution Statistics ({num_gpus} GPUs):")
     for topo_name, dist in hop_distributions.items():

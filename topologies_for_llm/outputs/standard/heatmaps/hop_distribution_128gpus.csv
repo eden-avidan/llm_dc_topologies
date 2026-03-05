@@ -1,0 +1,4 @@
+topology,num_gpus,gpus_per_hbi,avg_hops,total_pairs,hops_0_count,hops_0_pct,hops_1_count,hops_1_pct,hops_2_count,hops_2_pct,hops_3_count,hops_3_pct,hops_4_count,hops_4_pct,hops_5_count,hops_5_pct
+Fat Tree,128,8,3.57,16384,128,0.78,896,5.47,1920,11.72,0,0.0,13440,82.03,0,0.0
+DragonFly+,128,8,4.555,16384,128,0.78,896,5.47,0,0.0,0,0.0,3072,18.75,12288,75.0
+HyperX,128,8,3.68,16384,128,0.78,896,5.47,0,0.0,5120,31.25,7168,43.75,3072,18.75

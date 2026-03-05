@@ -16,7 +16,8 @@ from assign_and_plot import (
     plot_edge_load_bucket_hist_multiple,
     plot_edge_load_percentiles_multiple,
     plot_shortest_path_heatmap,
-    compute_gpu_to_gpu_delay_df
+    compute_gpu_to_gpu_delay_df,
+    load_and_compare_delay_percentiles
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -254,7 +255,7 @@ def create_all_topologies_and_graphs(
                 G,
                 OD,
                 num_endpoints=n,
-                split_equal_shortest=True,           # match your variant
+                split_equal_shortest=split_equal_shortest,           # match your variant
                 bandwidth_bytes_per_sec=50e9,        # example: 50 GB/s (set your own)
                 alpha_per_hop_sec=0.0,               # optional
                 save_dir=delay_save_dir,
@@ -309,8 +310,13 @@ def create_all_topologies_and_graphs(
             filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
         )
 
-        
+        percentiles_df = load_and_compare_delay_percentiles(
+            delay_save_dir,
+            workload_name=workload_name,
+            percentiles=(10, 25, 50, 60, 70, 80, 90, 95, 99),
+        )
 
+        percentiles_df.to_csv(os.path.join(delay_save_dir, f"percentiles_{workload_name}.csv"))
 
 
 def main() -> None:
