@@ -5,6 +5,7 @@ Created on Wed Aug 13 17:26:05 2025
 @author: elcha
 """
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import pandas as pd
 import re
 import numpy as np
@@ -16,31 +17,66 @@ from output_config import get_variant_paths
 parser = argparse.ArgumentParser(description='Generate plots from SimAI simulation results')
 parser.add_argument('--moe-active', action='store_true',
                     help='Use MOE-enabled workload data instead of regular workloads')
+parser.add_argument('--all-archs', action='store_true',
+                    help='Combine data from both MOE and standard workloads (~300 total workloads)')
 args = parser.parse_args()
+
+# Validate mutually exclusive flags
+if args.moe_active and args.all_archs:
+    print("❌ Error: --moe-active and --all-archs are mutually exclusive. Choose one.")
+    exit(1)
 
 #%% Configuration
 
-# Path to pkl files (depends on MOE flag)
-variant = "moe" if args.moe_active else "standard"
-paths = get_variant_paths(variant)
-PKL_DIR = str(paths["dataframes"])
-output_suffix = "_moe" if args.moe_active else ""
-
-if args.moe_active:
-    print("🔬 MOE Mode: Using MOE-enabled simulation data")
+# Path to pkl files (depends on flags)
+if args.all_archs:
+    variant = "all_archs"
+    paths = get_variant_paths(variant)
+    # Get paths for both standard and moe data
+    standard_paths = get_variant_paths("standard")
+    moe_paths = get_variant_paths("moe")
+    PKL_DIR_STANDARD = str(standard_paths["dataframes"])
+    PKL_DIR_MOE = str(moe_paths["dataframes"])
+    output_suffix = "_all_archs"
+    print("🌐 All Architectures Mode: Combining MOE and standard workloads")
 else:
-    print("📊 Standard Mode: Using regular simulation data")
-
-# Check if directory exists
-if not os.path.exists(PKL_DIR):
-    print(f"❌ Directory not found: {PKL_DIR}")
+    variant = "moe" if args.moe_active else "standard"
+    paths = get_variant_paths(variant)
+    PKL_DIR = str(paths["dataframes"])
+    output_suffix = "_moe" if args.moe_active else ""
+    
     if args.moe_active:
-        print("   Make sure to run 'Topologies Runtime.py --moe-active' first to generate MOE DataFrames")
+        print("🔬 MOE Mode: Using MOE-enabled simulation data")
     else:
-        print("   Make sure to run 'Topologies Runtime.py' first to generate DataFrames")
-    exit(1)
+        print("📊 Standard Mode: Using regular simulation data")
 
-print(f"📁 Reading data from: {PKL_DIR}")
+# Check if directories exist
+if args.all_archs:
+    missing_dirs = []
+    if not os.path.exists(PKL_DIR_STANDARD):
+        missing_dirs.append(f"Standard: {PKL_DIR_STANDARD}")
+    if not os.path.exists(PKL_DIR_MOE):
+        missing_dirs.append(f"MOE: {PKL_DIR_MOE}")
+    
+    if missing_dirs:
+        print("❌ Missing data directories:")
+        for d in missing_dirs:
+            print(f"   - {d}")
+        print("\n   Run 'Topologies Runtime.py' (standard) and 'Topologies Runtime.py --moe-active' (MOE) first")
+        exit(1)
+    
+    print(f"📁 Reading standard data from: {PKL_DIR_STANDARD}")
+    print(f"📁 Reading MOE data from: {PKL_DIR_MOE}")
+else:
+    if not os.path.exists(PKL_DIR):
+        print(f"❌ Directory not found: {PKL_DIR}")
+        if args.moe_active:
+            print("   Make sure to run 'Topologies Runtime.py --moe-active' first to generate MOE DataFrames")
+        else:
+            print("   Make sure to run 'Topologies Runtime.py' first to generate DataFrames")
+        exit(1)
+    
+    print(f"📁 Reading data from: {PKL_DIR}")
 
 # List of pkl files to process
 PKL_FILES = ['only_tp.pkl', 'only_dp.pkl', 'only_pp.pkl', 'Total.pkl']
@@ -64,17 +100,50 @@ for filename in PKL_FILES:
     print(f"{'='*60}")
 
     name = filename[:-4]  # without ".pkl"
-    filepath = os.path.join(PKL_DIR, filename)
+    
+    if args.all_archs:
+        # Load and concatenate from both standard and MOE directories
+        filepath_standard = os.path.join(PKL_DIR_STANDARD, filename)
+        filepath_moe = os.path.join(PKL_DIR_MOE, filename)
+        
+        dfs_to_concat = []
+        
+        if os.path.exists(filepath_standard):
+            df_standard = pd.read_pickle(filepath_standard)
+            # Add source column to track origin
+            df_standard['source'] = 'standard'
+            dfs_to_concat.append(df_standard)
+            print(f"  Loaded {len(df_standard)} standard workloads")
+        else:
+            print(f"  ⚠️  Standard file not found: {filepath_standard}")
+        
+        if os.path.exists(filepath_moe):
+            df_moe = pd.read_pickle(filepath_moe)
+            # Add source column to track origin
+            df_moe['source'] = 'moe'
+            dfs_to_concat.append(df_moe)
+            print(f"  Loaded {len(df_moe)} MOE workloads")
+        else:
+            print(f"  ⚠️  MOE file not found: {filepath_moe}")
+        
+        if not dfs_to_concat:
+            print(f"  ⚠️  No data found for {filename}, skipping")
+            continue
+        
+        total_runtime_df = pd.concat(dfs_to_concat, ignore_index=True)
+        total_runtime_df = total_runtime_df.sort_values(by='HyperX', ascending=True)
+        print(f"  Combined total: {len(total_runtime_df)} workloads")
+    else:
+        filepath = os.path.join(PKL_DIR, filename)
+        
+        # Check if file exists
+        if not os.path.exists(filepath):
+            print(f"⚠️  File not found: {filepath}")
+            continue
 
-    # Check if file exists
-    if not os.path.exists(filepath):
-        print(f"⚠️  File not found: {filepath}")
-        continue
-
-    total_runtime_df = pd.read_pickle(filepath)
-    total_runtime_df = total_runtime_df.sort_values(by='HyperX', ascending=True)
-
-    print(f"Loaded {len(total_runtime_df)} workloads")
+        total_runtime_df = pd.read_pickle(filepath)
+        total_runtime_df = total_runtime_df.sort_values(by='HyperX', ascending=True)
+        print(f"Loaded {len(total_runtime_df)} workloads")
 
     # Create subdirectory for this parallelism strategy
     strategy_dir = os.path.join(OUTPUT_DIR, name)
@@ -91,7 +160,9 @@ for filename in PKL_FILES:
     plt.xlabel("Workload index")
     plt.ylabel("Overhead Communication")
     title = f"Overhead Communication of Topologies - {name}"
-    if args.moe_active:
+    if args.all_archs:
+        title += " (All Architectures)"
+    elif args.moe_active:
         title += " (MOE)"
     plt.title(title)
     plt.legend()
@@ -188,7 +259,9 @@ for filename in PKL_FILES:
         ax = plot_data.plot(kind='bar', ax=plt.gca(), colormap='viridis')
 
         title = f"Topology Performance Comparison ({name}):\nTraffic Matrices Count per Overhead Communication Range for a Network of {size} GPUs"
-        if args.moe_active:
+        if args.all_archs:
+            title += " (All Architectures)"
+        elif args.moe_active:
             title += " (MOE)"
         plt.title(title, pad=20)
         plt.xlabel(f"Overhead Communication Time Bins ($\\times 10^{{{power_to_show}}}$)")
@@ -196,6 +269,10 @@ for filename in PKL_FILES:
         plt.xticks(rotation=45, ha='right')
         plt.legend(title="Topology")
         plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Force y-axis to show only whole numbers
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        
         plt.tight_layout()
 
         # Save histogram

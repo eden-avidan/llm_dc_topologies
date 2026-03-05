@@ -1,6 +1,6 @@
 import random
 from collections import defaultdict, deque
-from typing import Dict, Tuple, Iterable, List, Set
+from typing import Dict, Tuple, Iterable, List
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -982,3 +982,202 @@ def plot_shortest_path_heatmap_multiple(
         
         if save_dir:
             print(f"✅ Saved heatmap for {label}")
+
+
+def compute_gpu_to_gpu_delay_df(
+    G: nx.DiGraph,
+    OD_csr,
+    *,
+    num_endpoints: int,
+    weight: str = "weight",
+    split_equal_shortest: bool = False,
+    # Delay model parameters
+    bandwidth_bytes_per_sec: float | None = None,
+    alpha_per_hop_sec: float = 0.0,
+    # Edge attribute names
+    load_attr: str = "load",
+    capacity_attr: str = "capacity",
+    # Behavior
+    include_base_latency_when_zero: bool = False,
+    save_dir: str | None = None,
+    filename: str | None = None,
+) -> pd.DataFrame:
+    """Compute an estimated per-(GPU_i -> GPU_j) delay matrix as a DataFrame.
+
+    Purpose
+    -------
+    Demonstrate contention-driven delay using *routed per-edge loads*.
+
+    Model (per OD entry i->j with bytes S_ij)
+    -----------------------------------------
+    1) Choose shortest path(s) under the "no GPU transit" rule
+       (GPUs 0..num_endpoints-1 cannot be intermediate forwarding nodes).
+    2) For each edge e on the chosen path, compute an effective per-byte time:
+
+           t_e_per_byte = (1 / bw_e) * congestion_factor_e
+
+       where bw_e is link bandwidth (bytes/sec). We approximate congestion as:
+
+           congestion_factor_e = 1 / (1 - rho_e)
+
+       using, in priority order:
+         - edge attribute 'util' if present (annotate_graph_with_loads sets it)
+         - else, load/capacity if capacity is finite
+         - else, rho_e = 0
+
+    3) Delay is:
+
+           D_ij = alpha_per_hop_sec * hops_ij + S_ij * sum_{e in path} t_e_per_byte
+
+       If split_equal_shortest=True, we average D_ij uniformly across all equal-cost
+       shortest paths (ECMP-style).
+
+    Parameters
+    ----------
+    bandwidth_bytes_per_sec:
+        If provided, used as the bandwidth for ALL edges.
+        Otherwise we try to use edge[capacity_attr] if it is finite and >0.
+        If neither is available, fall back to 1.0 (normalized units).
+    alpha_per_hop_sec:
+        Optional per-hop fixed latency term.
+    include_base_latency_when_zero:
+        If True, pairs with S_ij==0 get alpha*hops (otherwise 0).
+    save_dir/filename:
+        If save_dir is given, we save the resulting DataFrame to CSV.
+    """
+
+    if num_endpoints <= 0:
+        raise ValueError("num_endpoints must be a positive int")
+
+    n = int(num_endpoints)
+    delay = np.zeros((n, n), dtype=np.float64)
+
+    def _edge_bw(u: int, v: int) -> float:
+        """Return bandwidth (bytes/sec) for edge (u,v)."""
+        if bandwidth_bytes_per_sec is not None:
+            return float(bandwidth_bytes_per_sec)
+        data = G.get_edge_data(u, v, default={})
+        cap = data.get(capacity_attr, None)
+        try:
+            cap_f = float(cap)
+        except (TypeError, ValueError):
+            cap_f = float("nan")
+        if np.isfinite(cap_f) and cap_f > 0:
+            return cap_f
+        return 1.0
+
+    def _congestion_factor(u: int, v: int) -> float:
+        """Return a multiplicative congestion penalty >=1 for edge (u,v)."""
+        data = G.get_edge_data(u, v, default={})
+
+        util = data.get("util", None)
+        if util is not None:
+            try:
+                rho = float(util)
+            except (TypeError, ValueError):
+                rho = 0.0
+        else:
+            load = float(data.get(load_attr, 0.0) or 0.0)
+            cap = data.get(capacity_attr, None)
+            try:
+                cap_f = float(cap)
+            except (TypeError, ValueError):
+                cap_f = float("nan")
+            if np.isfinite(cap_f) and cap_f > 0:
+                rho = load / cap_f
+            else:
+                rho = 0.0
+
+        # clamp
+        if rho < 0:
+            rho = 0.0
+        if rho >= 1.0:
+            rho = 0.999999
+
+        return 1.0 / (1.0 - rho)
+
+    # Iterate non-zeros in OD (CSR assumed)
+    for s in range(n):
+        row_start = OD_csr.indptr[s]
+        row_end = OD_csr.indptr[s + 1]
+
+        # If no traffic, optionally fill base-hop latency
+        if row_start == row_end:
+            if include_base_latency_when_zero:
+                for t in range(n):
+                    if s == t:
+                        continue
+                    try:
+                        path = _shortest_path_no_gpu_transit(G, s, t, num_endpoints=n, weight=weight)
+                        hops = max(0, len(path) - 1)
+                        delay[s, t] = alpha_per_hop_sec * hops
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        delay[s, t] = np.nan
+            continue
+
+        js = OD_csr.indices[row_start:row_end]
+        ds = OD_csr.data[row_start:row_end]
+
+        for t_raw, bytes_raw in zip(js, ds):
+            t = int(t_raw)
+            if t < 0 or t >= n or s == t:
+                continue
+
+            S = float(bytes_raw)
+            if S <= 0:
+                if include_base_latency_when_zero:
+                    try:
+                        path = _shortest_path_no_gpu_transit(G, s, t, num_endpoints=n, weight=weight)
+                        hops = max(0, len(path) - 1)
+                        delay[s, t] = alpha_per_hop_sec * hops
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        delay[s, t] = np.nan
+                else:
+                    delay[s, t] = 0.0
+                continue
+
+            try:
+                if not split_equal_shortest:
+                    path = _shortest_path_no_gpu_transit(G, s, t, num_endpoints=n, weight=weight)
+                    hops = max(0, len(path) - 1)
+
+                    per_byte = 0.0
+                    for u, v in zip(path[:-1], path[1:]):
+                        bw = _edge_bw(int(u), int(v))
+                        per_byte += (1.0 / bw) * _congestion_factor(int(u), int(v))
+
+                    delay[s, t] = alpha_per_hop_sec * hops + S * per_byte
+
+                else:
+                    paths = list(_all_shortest_paths_no_gpu_transit(G, s, t, num_endpoints=n, weight=weight))
+                    if not paths:
+                        delay[s, t] = np.nan
+                        continue
+
+                    acc = 0.0
+                    for path in paths:
+                        hops = max(0, len(path) - 1)
+                        per_byte = 0.0
+                        for u, v in zip(path[:-1], path[1:]):
+                            bw = _edge_bw(int(u), int(v))
+                            per_byte += (1.0 / bw) * _congestion_factor(int(u), int(v))
+                        acc += alpha_per_hop_sec * hops + S * per_byte
+
+                    delay[s, t] = acc / float(len(paths))
+
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                delay[s, t] = np.nan
+
+    labels = [f"GPU{i}" for i in range(n)]
+    df = pd.DataFrame(delay, index=labels, columns=labels)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_name = filename if filename is not None else "gpu_to_gpu_delay.csv"
+        if not out_name.lower().endswith(".csv"):
+            out_name = f"{out_name}.csv"
+        out_path = os.path.join(save_dir, out_name)
+        df.to_csv(out_path)
+        print(f"📄 Saved delay DataFrame CSV: {out_path}")
+
+    return df

@@ -15,6 +15,7 @@ OUTPUTS_DIR = BASE_DIR / "outputs"
 STANDARD_DIR = OUTPUTS_DIR / "standard"
 MOE_DIR = OUTPUTS_DIR / "moe"
 NO_MOE_DIR = OUTPUTS_DIR / "no_moe"
+ALL_ARCHS_DIR = OUTPUTS_DIR / "all_archs"
 COMPARISONS_DIR = OUTPUTS_DIR / "comparisons"
 METADATA_DIR = OUTPUTS_DIR / "metadata"
 
@@ -24,7 +25,7 @@ def get_variant_paths(variant="standard"):
     Get output paths for a specific variant.
 
     Args:
-        variant: "standard", "moe", or "no_moe"
+        variant: "standard", "moe", "no_moe", or "all_archs"
 
     Returns:
         dict with keys:
@@ -39,7 +40,8 @@ def get_variant_paths(variant="standard"):
     variant_map = {
         "standard": STANDARD_DIR,
         "moe": MOE_DIR,
-        "no_moe": NO_MOE_DIR
+        "no_moe": NO_MOE_DIR,
+        "all_archs": ALL_ARCHS_DIR
     }
 
     if variant not in variant_map:

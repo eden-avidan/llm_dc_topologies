@@ -15,7 +15,8 @@ from assign_and_plot import (
     plot_edge_load_cdf_multiple,
     plot_edge_load_bucket_hist_multiple,
     plot_edge_load_percentiles_multiple,
-    plot_shortest_path_heatmap
+    plot_shortest_path_heatmap,
+    compute_gpu_to_gpu_delay_df
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -239,7 +240,7 @@ def create_all_topologies_and_graphs(
 
     for variant_dirname, split_equal_shortest in variants:
         graphs_variant = {}
-
+        save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
         for topo_name, G_base in base_graphs.items():
             G = deepcopy(G_base)
             edge_load = assign_od_to_edges_shortest(
@@ -247,6 +248,20 @@ def create_all_topologies_and_graphs(
             )
             annotate_graph_with_loads(G, edge_load, capacity=None)
             graphs_variant[topo_name] = G
+            delay_save_dir = str(Path(save_dir) / "delay_matrices")
+            os.makedirs(delay_save_dir, exist_ok=True)
+            df_delay = compute_gpu_to_gpu_delay_df(
+                G,
+                OD,
+                num_endpoints=n,
+                split_equal_shortest=True,           # match your variant
+                bandwidth_bytes_per_sec=50e9,        # example: 50 GB/s (set your own)
+                alpha_per_hop_sec=0.0,               # optional
+                save_dir=delay_save_dir,
+                filename=f"{topo_name.replace(' ', '_')}_{workload_name}_delay.csv",
+            )
+
+
 
         heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
         for topo_name, graph in graphs_variant.items():
@@ -259,7 +274,7 @@ def create_all_topologies_and_graphs(
                 save_dir=heatmap_save_dir,
                 filename=f"{topo_name.replace(' ', '_')}_{workload_name}.png",
             )
-        save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
+        
         cdf_dir = str(Path(save_dir) / "cdf")
         histogram_dir = str(Path(save_dir) / "histogram")
         percentiles_dir = str(Path(save_dir) / "percentiles")
@@ -294,10 +309,13 @@ def create_all_topologies_and_graphs(
             filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
         )
 
+        
+
+
 
 def main() -> None:
     matrices_dirs = [matrices_moe, matrices]
-    workload_types = ["moe", "dense"]
+    workload_types = ["dense"]
 
     for matrices_dir, workload_type in zip(matrices_dirs, workload_types):
         print(f"\n=== Loading {workload_type} from {matrices_dir} ===")
@@ -329,7 +347,7 @@ def main() -> None:
         #         endpoints_per_router=8,
         #         inter_group_variant="medium",
         #     )
-        world_sizes = [128, 1024]
+        world_sizes = [128, 256, 512, 1024]
         for i in world_sizes:
             chosen = next((name for name, M in workloads.items() if M.shape[0] == i), None)
             if chosen is None:

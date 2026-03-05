@@ -296,6 +296,139 @@ def HyperX_latency_8_nodes_under_switch(i_location, j_location, num_gpus=128):
 #     return result
 
 
+def plot_hop_distribution(num_gpus: int, n_hbi: int, output_dir: str):
+    """
+    Generate a bar chart comparing the distribution of hop counts across
+    Fat Tree, DragonFly+, and HyperX topologies.
+    
+    Args:
+        num_gpus: Total number of GPUs in the system
+        n_hbi: Number of GPUs per HBI (High Bandwidth Interconnect)
+        output_dir: Directory to save the output plot
+    """
+    import matplotlib.pyplot as plt
+    from collections import defaultdict
+    
+    # Store global N_hbi for index_to_location function
+    global N_hbi
+    original_n_hbi = N_hbi
+    N_hbi = n_hbi
+    
+    # Topologies to compare (excluding rail_only as it has None values)
+    topologies_to_plot = {
+        "Fat Tree": Fat_Tree_latency,
+        "DragonFly+": dragonFlyP_latency,
+        "HyperX": HyperX_latency_8_nodes_under_switch
+    }
+    
+    # Calculate hop distributions for each topology
+    hop_distributions = {}
+    for topo_name, latency_func in topologies_to_plot.items():
+        hop_counts = defaultdict(int)
+        
+        for i in range(num_gpus):
+            for j in range(num_gpus):
+                i_loc = index_to_location(i)
+                j_loc = index_to_location(j)
+                
+                if topo_name == "HyperX":
+                    hops = latency_func(i_loc, j_loc, num_gpus)
+                else:
+                    hops = latency_func(i_loc, j_loc)
+                
+                if hops is not None:
+                    hop_counts[int(hops)] += 1
+        
+        hop_distributions[topo_name] = dict(hop_counts)
+    
+    # Restore original N_hbi
+    N_hbi = original_n_hbi
+    
+    # Get all unique hop values across all topologies
+    all_hops = set()
+    for dist in hop_distributions.values():
+        all_hops.update(dist.keys())
+    all_hops = sorted(all_hops)
+    
+    # Convert counts to percentages
+    hop_percentages = {}
+    for topo_name, dist in hop_distributions.items():
+        total = sum(dist.values())
+        hop_percentages[topo_name] = {h: (c / total) * 100 for h, c in dist.items()}
+    
+    # Create the grouped bar chart
+    fig, ax = plt.subplots(figsize=(12, 7), dpi=150)
+    
+    # Bar positioning
+    x = np.arange(len(all_hops))
+    num_topos = len(topologies_to_plot)
+    bar_width = 0.25
+    offsets = np.linspace(-(num_topos - 1) / 2, (num_topos - 1) / 2, num_topos) * bar_width
+    
+    # Use default matplotlib color cycle
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    
+    # Plot bars for each topology
+    for idx, (topo_name, pct_dist) in enumerate(hop_percentages.items()):
+        percentages = [pct_dist.get(h, 0) for h in all_hops]
+        bars = ax.bar(
+            x + offsets[idx],
+            percentages,
+            bar_width,
+            label=topo_name,
+            color=default_colors[idx % len(default_colors)],
+            edgecolor='white',
+            linewidth=0.5
+        )
+        
+        # Add value labels on top of bars (only for non-zero values)
+        for bar, pct in zip(bars, percentages):
+            if pct > 0:
+                height = bar.get_height()
+                ax.annotate(
+                    f'{pct:.1f}%',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom',
+                    fontsize=8
+                )
+    
+    # Styling
+    ax.set_xlabel("Number of Hops", fontsize=12, fontweight='bold')
+    ax.set_ylabel("Percentage of GPU Pairs (%)", fontsize=12, fontweight='bold')
+    ax.set_title(
+        f"Hop Count Distribution Across Topologies\n({num_gpus} GPUs, {n_hbi} GPUs per HBI)",
+        fontsize=14,
+        fontweight='bold'
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(all_hops, fontsize=11)
+    ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.set_axisbelow(True)
+    ax.set_ylim(0, 100)  # Percentage scale 0-100%
+    
+    # Format y-axis as percentage
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.0f}%'))
+    
+    # Tight layout and save
+    plt.tight_layout()
+    filename = f"{output_dir}/hop_distribution_{num_gpus}gpus.png"
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📊 Saved hop distribution plot → {filename}")
+    
+    # Also print statistics summary
+    print(f"\n📈 Hop Distribution Statistics ({num_gpus} GPUs):")
+    for topo_name, dist in hop_distributions.items():
+        total_pairs = sum(dist.values())
+        weighted_sum = sum(h * c for h, c in dist.items())
+        avg_hops = weighted_sum / total_pairs if total_pairs > 0 else 0
+        pct_dist = {h: f"{(c / total_pairs) * 100:.1f}%" for h, c in sorted(dist.items())}
+        print(f"   {topo_name}: avg={avg_hops:.2f} hops, distribution={pct_dist}")
+
 
 #%% Topologies:
 
@@ -608,7 +741,10 @@ for topo_name, matrix in dist_matrices.items():
     df_heatmap = pd.DataFrame(matrix, index=gpu_labels, columns=gpu_labels)
     df_heatmap.to_csv(csv_filename)
     print(f"📄 Saved CSV for {topo_name} → {csv_filename}")    
-    
+
+# Generate hop distribution comparison plot
+plot_hop_distribution(num_gpus=GPUs_num, n_hbi=N_hbi, output_dir=output_dir)
+
 for topo_name, statistic in statistic_dict.items():
     print(topo_name)
     print(statistic)
