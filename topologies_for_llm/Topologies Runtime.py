@@ -99,12 +99,12 @@ def get_N_hbi(file_index: int) -> int | None:
 #%% Constants:
 
 GPUs_num = 0 #len(get_matrix()) # below - update for each matrix
-N_hbi = 0 #8 # amount of GPUs in each HBI
+N_hbi = 8 # amount of GPUs in each HBI
 N_nodes_1dim = 0#int((GPUs_num/N_hbi)**0.5)
 
 # def update_constants(file_index):
     # GPUs_num = len(get_matrix(file_index))
-
+HBI_link = 1
 T_link = 1
 T_link_out = T_link
 T_link_in = T_link
@@ -131,15 +131,31 @@ def location_to_HyperX_location(loc):
     
 #%% Latency Between 2 GPUs:
 
+HBI_SIZE = 8
+SWITCH_UP_LINKS = 64
+SWITCH_DOWN_LINKS = 64
+DRAGONFLY_PLUS_GROUP_LEAF_COUNT = 4
+DRAGONFLY_PLUS_GROUP_SPINE_COUNT = 4
+
 def Fat_Tree_latency(i_location, j_location):
+    latency = 0
     if i_location == j_location:
-        return 0
+        # Same GPU
+        latency = 0
     elif i_location.HBI_index == j_location.HBI_index:
-        return 2 * T_link_in
-    elif i_location.GPU_index == j_location.GPU_index:
-        return 2 * T_link_out
+        # same HBI
+        latency = 1 * HBI_link
+    elif i_location.GPU_index == j_location.GPU_index and i_location.HBI_index // SWITCH_DOWN_LINKS == j_location.HBI_index // SWITCH_DOWN_LINKS:
+        # different HBI but under the same Rail
+        latency = 2 * T_link
+    elif i_location.GPU_index != j_location.GPU_index and i_location.HBI_index // SWITCH_DOWN_LINKS == j_location.HBI_index // SWITCH_DOWN_LINKS:
+        # non-relevant rail under the same spine: gpu1 - rail1 - spine1 - rail2 - gpu2
+        latency = 4 * T_link
     else:
-        return 4 * T_link_out
+        # gpu1 - rail1 - spine1 - super spine1 - spine2 - rail2 - gpu2
+        latency = 6 * T_link
+        # print(f"GPU {i_location.HBI_index}, {i_location.GPU_index} to GPU {j_location.HBI_index}, {j_location.GPU_index}: {latency}")
+    return latency
 
 
 def Rail_Only_latency(i_location, j_location):
@@ -150,29 +166,120 @@ def Rail_Only_latency(i_location, j_location):
 
 
 def dragonFlyP_latency(i_location, j_location):
+    latency = 0
     if i_location == j_location:
-        return 0
+        # Same GPU
+        latency = 0
     elif i_location.HBI_index == j_location.HBI_index:
-        return 2 * T_link_in + 2
-    # elif i_location.GPU_index == j_location.GPU_index:
-        # return 3 * T_link
+        # Same HBI
+        latency = 1 * HBI_link
+    elif i_location.HBI_index // DRAGONFLY_PLUS_GROUP_LEAF_COUNT == j_location.HBI_index // DRAGONFLY_PLUS_GROUP_LEAF_COUNT:
+        # Same group different HBI
+        latency = 4 * T_link
     else:
-        return 3 * T_link + 2
+        latency = 5 * T_link
+    return latency
 
-def HyperX_latency_8_nodes_under_switch(i_location, j_location):
-    
-    if (i_location == j_location):
-        return 0
-    i_HyperX_loc = location_to_HyperX_location(i_location)
-    j_HyperX_loc = location_to_HyperX_location(j_location)
-    result = 1
-    if i_HyperX_loc.GPU_index != j_HyperX_loc.GPU_index:
-        result = result+1
-    if i_HyperX_loc.HBI_index_1 != j_HyperX_loc.HBI_index_1:
-        result = result+2
-    if i_HyperX_loc.HBI_index_2 != j_HyperX_loc.HBI_index_2:
-        result = result+1
-    return result
+
+from typing import Tuple
+from math import ceil, floor
+
+def minimal_balanced_3d_dims(num_gpus: int, gpus_per_hbi: int = 8):
+    """
+    Find (Sx, Sy, Sz) such that:
+      - Sx*Sy*Sz >= routers = ceil(num_gpus/gpus_per_hbi)
+      - Volume is minimal
+      - Among minimal volumes, dims are as balanced as possible (closest to cube)
+
+    Returns dims sorted descending (Sx >= Sy >= Sz) for determinism.
+    """
+    R = ceil(num_gpus / gpus_per_hbi)
+    if R <= 1:
+        return (1, 1, 1)
+
+    best = None  # (volume, imbalance, spread, dims)
+
+    # Bound search:
+    # Sz <= Sy <= Sx and Sz up to cube root, Sy up to sqrt(R/Sz)
+    max_sz = ceil(R ** (1/3)) + 2  # small cushion
+    for Sz in range(1, max_sz + 1):
+        # minimal possible Sy for this Sz is 1
+        # maximal Sy we need to consider is around sqrt(R/Sz)
+        max_sy = ceil((R / Sz) ** 0.5) + 2
+        for Sy in range(Sz, max_sy + 1):
+            # minimal Sx needed to reach >= R
+            Sx = ceil(R / (Sy * Sz))
+            if Sx < Sy:
+                Sx = Sy  # enforce Sx >= Sy
+
+            V = Sx * Sy * Sz
+            if V < R:
+                continue
+
+            dims = (Sx, Sy, Sz)
+            imbalance = Sx - Sz
+            spread = (Sx - Sy) ** 2 + (Sy - Sz) ** 2 + (Sx - Sz) ** 2
+
+            cand = (V, imbalance, spread, dims)
+            if best is None or cand < best:
+                best = cand
+
+        # Optional early break:
+        # once Sz gets too large, volume will generally grow, but keeping it simple is fine.
+
+    return best[3]
+
+    return best_dims
+
+@dataclass(frozen=True)
+class HyperXGPUPlacement:
+    """
+    Maps (HBI/router index, GPU index within that HBI) -> (x, y, z) router coords.
+
+    Assumes:
+      - Routers are indexed 0..(Sx*Sy*Sz - 1) in row-major order where z is fastest:
+            idx = (x * Sy + y) * Sz + z
+      - gpu_in_hbi is validated but not used for coords (coords are router-only).
+    """
+    dims: Tuple[int, int, int]  # (Sx, Sy, Sz)
+
+    def router_coords(self, *, hbi_idx: int, gpu_in_hbi: int) -> Tuple[int, int, int]:
+        sx, sy, sz = self.dims
+        if sx <= 0 or sy <= 0 or sz <= 0:
+            raise ValueError(f"dims must be positive, got {self.dims!r}")
+
+        r = sx * sy * sz
+        if not (0 <= hbi_idx < r):
+            raise ValueError(f"hbi_idx out of range: {hbi_idx} not in [0, {r-1}]")
+
+        if not (0 <= gpu_in_hbi < 8):
+            raise ValueError(f"gpu_in_hbi must be in [0,7], got {gpu_in_hbi}")
+
+        # Row-major with z fastest: idx = (x*Sy + y)*Sz + z
+        x = hbi_idx // (sy * sz)
+        rem = hbi_idx % (sy * sz)
+        y = rem // sz
+        z = rem % sz
+        return int(x), int(y), int(z)
+
+
+def HyperX_latency_8_nodes_under_switch(i_location, j_location, num_gpus=128):
+    hyperx_gpu_placement = HyperXGPUPlacement(dims=minimal_balanced_3d_dims(num_gpus=num_gpus))
+    print(f"HyperX GPU placement: {hyperx_gpu_placement.dims}")
+    latency = 0
+
+    if i_location == j_location:
+        # Same GPU
+        latency = 0
+    elif i_location.HBI_index == j_location.HBI_index:
+        # Same HBI
+        latency = 1 * HBI_link
+    else:
+        i_x, i_y, i_z = hyperx_gpu_placement.router_coords(hbi_idx=i_location.HBI_index, gpu_in_hbi=i_location.GPU_index)
+        j_x, j_y, j_z = hyperx_gpu_placement.router_coords(hbi_idx=j_location.HBI_index, gpu_in_hbi=j_location.GPU_index)
+        latency = int(i_x != j_x) + int(i_y != j_y) + int(i_z != j_z) + 2
+        # print(f"GPU i: ({i_x}, {i_y}, {i_z}) to GPU j: ({j_x}, {j_y}, {j_z}): {latency}")
+    return latency
 
 def HyperX_latency_1_nodes_under_switch(i_location, j_location):
     
@@ -425,13 +532,43 @@ print(f"\n🗺️  Generating heatmaps in: {output_dir}/")
 for topo_name, matrix in dist_matrices.items():
     plt.figure(figsize=(10, 8))
 
-    discrete_values = [0, 1, 2, 3, 4, 5]
+    # Determine discrete values from matrix (matching assign_and_plot.py logic)
+    valid_values = matrix[~np.isnan(matrix)]
+    if valid_values.size > 0:
+        min_dist = int(np.min(valid_values))
+        max_dist = int(np.max(valid_values))
+    else:
+        min_dist, max_dist = 0, 5
+    
+    # Ensure at least 7 discrete color values
+    min_colors = 7
+    if max_dist - min_dist + 1 < min_colors:
+        max_dist = min_dist + min_colors - 1
+    discrete_values = list(range(min_dist, max_dist + 1))
 
-                # צבעים מתוך viridis, לפי מספר הערכים
-    cmap = ListedColormap(plt.cm.viridis(np.linspace(0, 1, len(discrete_values))))
+    # Cold-to-warm color scale (same as assign_and_plot.py)
+    cold_to_warm = [
+        '#313695',  # deep navy (coldest)
+        '#74add1',  # distinct mid-blue
+        '#e0f3f8',  # pale icy blue
+        '#fee090',  # pale warm yellow
+        '#f46d43',  # vibrant orange-red
+        '#a50026',  # deep crimson (warmest)
+    ]
+    
+    # Select colors based on number of discrete values needed
+    num_colors = len(discrete_values)
+    if num_colors <= len(cold_to_warm):
+        # Pick evenly spaced colors from our palette
+        indices = np.linspace(0, len(cold_to_warm) - 1, num_colors).astype(int)
+        colors = [cold_to_warm[i] for i in indices]
+    else:
+        # Fall back to coolwarm colormap for more colors
+        colors = plt.cm.coolwarm(np.linspace(0, 1, num_colors))
+    cmap = ListedColormap(colors)
 
-# גבולות בין הערכים
-    bounds = np.arange(len(discrete_values) + 1) - 0.5
+    # Boundaries for discrete colors
+    bounds = np.arange(len(discrete_values) + 1) - 0.5 + min_dist
     norm = BoundaryNorm(bounds, cmap.N)
 
     sns.heatmap(
