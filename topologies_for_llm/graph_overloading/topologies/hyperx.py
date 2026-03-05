@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -9,107 +10,108 @@ import networkx as nx
 from .abstract_topology import Topology, TopologyBuildResult
 
 
+def minimal_balanced_3d_dims(num_gpus: int, gpus_per_hbi: int = 8) -> Tuple[int, int, int]:
+    """
+    Same dimension-sizing logic as your numeric HyperX implementation.
+
+    Find (Sx, Sy, Sz) such that:
+      - Sx*Sy*Sz >= routers = ceil(num_gpus/gpus_per_hbi)
+      - Volume is minimal
+      - Among minimal volumes, dims are as balanced as possible (closest to cube)
+
+    Returns dims sorted descending (Sx >= Sy >= Sz) for determinism.
+    """
+    R = ceil(num_gpus / gpus_per_hbi)
+    if R <= 1:
+        return (1, 1, 1)
+
+    best = None  # (volume, imbalance, spread, dims)
+
+    max_sz = ceil(R ** (1 / 3)) + 2
+    for Sz in range(1, max_sz + 1):
+        max_sy = ceil((R / Sz) ** 0.5) + 2
+        for Sy in range(Sz, max_sy + 1):
+            Sx = ceil(R / (Sy * Sz))
+            if Sx < Sy:
+                Sx = Sy
+
+            V = Sx * Sy * Sz
+            if V < R:
+                continue
+
+            dims = (int(Sx), int(Sy), int(Sz))
+            imbalance = Sx - Sz
+            spread = (Sx - Sy) ** 2 + (Sy - Sz) ** 2 + (Sx - Sz) ** 2
+
+            cand = (V, imbalance, spread, dims)
+            if best is None or cand < best:
+                best = cand
+
+    return best[3]
+
+
 class HyperX(Topology):
     """
-    HyperX topology (classic complete connectivity per dimension), with direct GPU-GPU links
-    within each router/HBI group.
+    HyperX topology matching your numeric model:
 
-    Structure:
-      - endpoints_per_router GPUs are connected to each router
-      - GPUs within the same router have direct links (full mesh)
-      - Routers are connected in a HyperX pattern (complete graph per dimension)
+    - Routers correspond 1:1 with HBI groups (8 GPUs per router/HBI)
+    - GPUs within the same router have direct links (full mesh) => distance 1
+    - Routers are connected so that router-to-router shortest hop count equals
+      (# of differing coordinates) in 3D, i.e. a "clique per dimension" HyperX:
+        * If x differs: there is a direct link to the router with same (y,z) and new x
+        * Similarly for y, z
+      Therefore:
+        GPU_i -> RouterA -> (k router hops) -> RouterB -> GPU_j
+      gives total GPU-to-GPU = k + 2 where k is number of differing dims.
 
-    Distance model:
-      - Same router (consecutive endpoints_per_router GPUs): 1 hop (direct GPU-GPU link)
-      - Different routers: (number of differing dimensions) + 2 hops
-        - e.g., differ in 1 dim: GPU → Router1 → Router2 → GPU = 3 hops
-        - e.g., differ in 2 dims: GPU → R1 → R2 → R3 → GPU = 4 hops
-        - e.g., differ in 3 dims: GPU → R1 → R2 → R3 → R4 → GPU = 5 hops
-
-    Model:
-      - Endpoints (GPUs): nodes [0..num_nodes-1]
-      - Routers (HBIs): nodes [num_nodes .. num_nodes + R - 1]
+    Node IDs:
+      - GPUs:   0 .. n-1
+      - Routers: n .. n+R-1   (R = Sx*Sy*Sz)
     """
 
     def __init__(
         self,
-        num_nodes: int,
+        num_nodes: int,  # GPUs
         *,
         router_ports: int = 64,
-        endpoints_per_router: int = 8,
-        dims: Tuple[int, ...] | None = None,
-        connect_all_in_dimension: bool = True,
+        endpoints_per_router: int = 8,  # must be 8 to match numeric model
+        dims: Tuple[int, int, int] | None = None,  # optional override
         link_capacity: float = 1.0,
         link_weight: float = 1.0,
-        auto_dims_D: int = 3,
     ) -> None:
         super().__init__(num_nodes)
 
         if router_ports <= 1:
             raise ValueError("router_ports must be > 1")
-        if endpoints_per_router <= 0:
-            raise ValueError("endpoints_per_router must be > 0")
-        if dims is not None and (len(dims) == 0 or any(int(s) <= 0 for s in dims)):
-            raise ValueError("dims must be a tuple of positive ints")
+        if endpoints_per_router != 8:
+            raise ValueError("This HyperX model is fixed to 8 GPUs per HBI/router (endpoints_per_router=8).")
+        if dims is not None:
+            if len(dims) != 3 or any(int(s) <= 0 for s in dims):
+                raise ValueError("dims must be a 3-tuple of positive ints (Sx,Sy,Sz).")
         if link_capacity <= 0:
             raise ValueError("link_capacity must be > 0")
         if link_weight <= 0:
             raise ValueError("link_weight must be > 0")
-        if auto_dims_D < 1:
-            raise ValueError("auto_dims_D must be >= 1")
 
         self.router_ports = int(router_ports)
-        self.p = int(endpoints_per_router)
+        self.p = int(endpoints_per_router)  # 8
         self.dims = tuple(int(x) for x in dims) if dims is not None else None
-        self.connect_all_in_dimension = bool(connect_all_in_dimension)
         self.link_capacity = float(link_capacity)
         self.link_weight = float(link_weight)
-        self.auto_dims_D = int(auto_dims_D)
 
         self._cached_build: TopologyBuildResult | None = None
-
-    @staticmethod
-    def _prime_factors(n: int) -> List[int]:
-        f: List[int] = []
-        x = n
-        d = 2
-        while d * d <= x:
-            while x % d == 0:
-                f.append(d)
-                x //= d
-            d += 1
-        if x > 1:
-            f.append(x)
-        return f
-
-    @staticmethod
-    def _balanced_dims(target_routers: int, D: int) -> Tuple[int, ...]:
-        dims = [1] * D
-        for p in sorted(HyperX._prime_factors(target_routers), reverse=True):
-            i = int(np.argmin(dims))
-            dims[i] *= p
-        dims.sort(reverse=True)
-        return tuple(int(x) for x in dims)
-
-    def _auto_choose_dims(self, needed_routers: int) -> Tuple[int, ...]:
-        """
-        Autoselect dims (shape) given needed router count.
-
-        Uses balanced factorization to distribute routers across D dimensions
-        as evenly as possible.
-        """
-        R = int(max(1, needed_routers))
-        return self._balanced_dims(R, self.auto_dims_D)
 
     def build_topology(self) -> TopologyBuildResult:
         n = self.num_nodes
         P = self.router_ports
-        p = self.p
+        p = self.p  # 8
 
-        routers_min = int(np.ceil(n / p))
+        routers_min = int(ceil(n / p))
 
-        dims = self.dims if self.dims is not None else self._auto_choose_dims(routers_min)
-        R = int(np.prod(dims))
+        # ---- DIM SELECTION (matches your numeric implementation) ----
+        dims = self.dims if self.dims is not None else minimal_balanced_3d_dims(num_gpus=n, gpus_per_hbi=p)
+        Sx, Sy, Sz = (int(dims[0]), int(dims[1]), int(dims[2]))
+        R = int(Sx * Sy * Sz)
 
         if R < routers_min:
             raise ValueError(
@@ -117,66 +119,61 @@ class HyperX(Topology):
                 f"(need at least {routers_min} routers)."
             )
 
-        if not self.connect_all_in_dimension:
-            raise NotImplementedError("Only connect_all_in_dimension=True is implemented.")
-
-        # Degree for classic HyperX with K=1
-        degree_inter = int(sum((s - 1) for s in dims))
-
+        # Classic HyperX degree with full connectivity per dimension:
+        # degree_inter = (Sx-1) + (Sy-1) + (Sz-1)
+        degree_inter = (Sx - 1) + (Sy - 1) + (Sz - 1)
         if p + degree_inter > P:
             raise ValueError(
-                f"Port constraint violated: {p} + sum(Sd-1)={degree_inter} => {p + degree_inter} > {P}. "
-                "Reduce dims, reduce endpoints_per_router, or increase router_ports."
+                f"Port constraint violated: endpoints_per_router={p} + interconnect_degree={degree_inter} "
+                f"=> {p + degree_inter} > router_ports={P}. "
+                "Reduce dims (override), reduce routers (smaller n), or increase router_ports."
             )
 
         router_base = n
         router_ids = np.arange(router_base, router_base + R, dtype=np.int32)
         total_nodes = int(router_base + R)
 
-        # GPU -> router mapping: contiguous blocks of size p (NO modulo wrap)
-        # This matches your heatmap assumption: each HBI connects exactly 8 GPUs.
+        # ---- GPU -> router mapping: contiguous groups of 8 (same as your code) ----
         gpu_to_router = np.empty(n, dtype=np.int32)
-        for i in range(n):
-            ridx = i // p
+        for gpu in range(n):
+            ridx = gpu // p
             if ridx >= R:
                 raise ValueError(
-                    f"Not enough routers for contiguous mapping: GPU {i} maps to router index {ridx}, "
-                    f"but only {R} routers exist. Increase dims product or reduce endpoints_per_router."
+                    f"Not enough routers for contiguous mapping: GPU {gpu} maps to router index {ridx}, "
+                    f"but only {R} routers exist. Increase dims product or reduce num_nodes."
                 )
-            gpu_to_router[i] = int(router_ids[ridx])
+            gpu_to_router[gpu] = int(router_ids[ridx])
 
-        # Coordinate helpers for routers 0..R-1 (row-major indexing for shape=dims)
-        strides: List[int] = []
-        prod = 1
-        for s in reversed(dims):
-            strides.append(prod)
-            prod *= s
-        strides = list(reversed(strides))
+        # ---- Router coordinate maps (MUST match your numeric: z fastest row-major) ----
+        # numeric: idx = (x*Sy + y)*Sz + z
+        def idx_to_coord(ridx: int) -> Tuple[int, int, int]:
+            x = ridx // (Sy * Sz)
+            rem = ridx % (Sy * Sz)
+            y = rem // Sz
+            z = rem % Sz
+            return int(x), int(y), int(z)
 
-        def idx_to_coord(idx: int) -> Tuple[int, ...]:
-            return tuple(int((idx // st) % s) for s, st in zip(dims, strides))
+        def coord_to_idx(coord: Tuple[int, int, int]) -> int:
+            x, y, z = coord
+            return int((x * Sy + y) * Sz + z)
 
-        def coord_to_idx(coord: Tuple[int, ...]) -> int:
-            return int(sum(int(c) * int(st) for c, st in zip(coord, strides)))
-
-        # --- explicit coordinate maps ---
-        router_idx_to_coord: Dict[int, Tuple[int, ...]] = {}
-        router_id_to_coord: Dict[int, Tuple[int, ...]] = {}
+        router_idx_to_coord: Dict[int, Tuple[int, int, int]] = {}
+        router_id_to_coord: Dict[int, Tuple[int, int, int]] = {}
         for ridx in range(R):
             c = idx_to_coord(ridx)
             router_idx_to_coord[ridx] = c
             router_id_to_coord[int(router_base + ridx)] = c
 
         gpu_id_to_router_idx = np.empty(n, dtype=np.int32)
-        gpu_id_to_coord: Dict[int, Tuple[int, ...]] = {}
+        gpu_id_to_coord: Dict[int, Tuple[int, int, int, int]] = {}
         for gpu in range(n):
-            ridx = gpu // p  # contiguous blocks
+            ridx = int(gpu // p)
             gpu_id_to_router_idx[gpu] = ridx
-            rc = router_idx_to_coord[ridx]
-            i = gpu % p
-            gpu_id_to_coord[gpu] = (*rc, int(i))  # (x,y,z,i)
+            x, y, z = router_idx_to_coord[ridx]
+            i = int(gpu % p)
+            gpu_id_to_coord[gpu] = (x, y, z, i)  # include gpu-in-hbi for convenience
 
-
+        # ---- Edges ----
         edges_u: List[int] = []
         edges_v: List[int] = []
 
@@ -184,45 +181,62 @@ class HyperX(Topology):
             edges_u.append(u); edges_v.append(v)
             edges_u.append(v); edges_v.append(u)
 
-        # (1) GPU <-> Router
+        # (1) GPU <-> Router edges
         for gpu in range(n):
             add_bidir(int(gpu), int(gpu_to_router[gpu]))
 
-        # (1b) Direct GPU <-> GPU links within each router group (full mesh)
-        # This creates direct distance-1 links between consecutive endpoints_per_router GPUs
+        # (1b) Direct GPU <-> GPU links within each router (full mesh) => distance 1 within HBI
         for ridx in range(R):
             base_gpu = ridx * p
-            # Create full mesh within the router group
             for i in range(p):
                 for j in range(i + 1, p):
-                    gpu_i = base_gpu + i
-                    gpu_j = base_gpu + j
-                    if gpu_i < n and gpu_j < n:
-                        add_bidir(gpu_i, gpu_j)
+                    gi = base_gpu + i
+                    gj = base_gpu + j
+                    if gi < n and gj < n:
+                        add_bidir(int(gi), int(gj))
 
-        # (2) Router-router HyperX links (differ in exactly 1 coordinate)
+        # (2) Router-router HyperX links:
+        # For each router, connect to all routers that differ in exactly 1 coord
+        # while keeping other coords identical. This yields router distance = #diff_dims.
         undirected = set()
         for src_idx in range(R):
-            c = list(idx_to_coord(src_idx))
+            x, y, z = idx_to_coord(src_idx)
             src = int(router_base + src_idx)
 
-            for d, Sd in enumerate(dims):
-                orig = c[d]
-                for new_val in range(Sd):
-                    if new_val == orig:
-                        continue
-                    c[d] = new_val
-                    dst_idx = coord_to_idx(tuple(c))
-                    dst = int(router_base + dst_idx)
-
-                    key = (min(src, dst), max(src, dst))
-                    if key in undirected:
-                        continue
+            # vary x
+            for nx_ in range(Sx):
+                if nx_ == x:
+                    continue
+                dst_idx = coord_to_idx((nx_, y, z))
+                dst = int(router_base + dst_idx)
+                key = (min(src, dst), max(src, dst))
+                if key not in undirected:
                     undirected.add(key)
                     add_bidir(src, dst)
 
-                c[d] = orig
+            # vary y
+            for ny_ in range(Sy):
+                if ny_ == y:
+                    continue
+                dst_idx = coord_to_idx((x, ny_, z))
+                dst = int(router_base + dst_idx)
+                key = (min(src, dst), max(src, dst))
+                if key not in undirected:
+                    undirected.add(key)
+                    add_bidir(src, dst)
 
+            # vary z
+            for nz_ in range(Sz):
+                if nz_ == z:
+                    continue
+                dst_idx = coord_to_idx((x, y, nz_))
+                dst = int(router_base + dst_idx)
+                key = (min(src, dst), max(src, dst))
+                if key not in undirected:
+                    undirected.add(key)
+                    add_bidir(src, dst)
+
+        # ---- Pack edges + attributes ----
         edges = np.column_stack(
             (np.asarray(edges_u, dtype=np.int32), np.asarray(edges_v, dtype=np.int32))
         )
@@ -231,54 +245,59 @@ class HyperX(Topology):
         weight = np.full((m,), self.link_weight, dtype=np.float32)
 
         meta: Dict[str, Any] = {
-            "topology": "HyperX (complete-dimension, with direct GPU-GPU links)",
+            "topology": "HyperX-3D (numeric-dims, z-fastest, direct intra-HBI GPU links)",
             "num_endpoints": n,
             "router_ports": P,
             "params": {
-                "dims": dims,
+                "dims": (Sx, Sy, Sz),
                 "routers": R,
                 "endpoints_per_router": p,
                 "connect_all_in_dimension": True,
+                "coord_order": "row-major with z fastest: idx=(x*Sy + y)*Sz + z",
+                "dim_choice": "minimal_balanced_3d_dims(num_gpus, gpus_per_hbi=8)",
             },
             "distance_model": {
+                "same_gpu": 0,
                 "same_router": 1,
-                "differ_1_dim": 3,  # 1 + 2
-                "differ_2_dims": 4,  # 2 + 2
-                "differ_3_dims": 5,  # 3 + 2
-                "formula": "differing_dimensions + 2",
+                "different_routers": "diff_dims(x,y,z) + 2",
+                "examples": {
+                    "diff_1_dim": 3,
+                    "diff_2_dims": 4,
+                    "diff_3_dims": 5,
+                },
             },
             "port_accounting_per_router": {
                 "endpoint_ports": p,
-                "interconnect_ports": degree_inter,
-                "total_used": p + degree_inter,
+                "interconnect_ports": int(degree_inter),
+                "total_used": int(p + degree_inter),
                 "budget": P,
             },
             "counts": {
                 "total_nodes_including_routers": total_nodes,
                 "routers": R,
                 "endpoints": n,
-                "direct_gpu_links_per_router": p * (p - 1) // 2,  # full mesh = C(p,2)
+                "direct_gpu_links_per_router": p * (p - 1) // 2,
             },
             "node_ranges": {
                 "endpoints": (0, n - 1),
                 "routers": (router_base, router_base + R - 1),
             },
             "gpu_to_router": gpu_to_router,
+            "coord_maps": {
+                "router_idx_to_coord": router_idx_to_coord,
+                "router_id_to_coord": router_id_to_coord,
+                "gpu_id_to_coord": gpu_id_to_coord,
+                "gpu_id_to_router_idx": gpu_id_to_router_idx,
+            },
         }
 
-        meta["coord_maps"] = {
-            "router_idx_to_coord": router_idx_to_coord,
-            "router_id_to_coord": router_id_to_coord,
-            "gpu_id_to_coord": gpu_id_to_coord,
-            "gpu_id_to_router_idx": gpu_id_to_router_idx,
-        }        
-        
         res = TopologyBuildResult(edges=edges, attrs={"capacity": capacity, "weight": weight}, meta=meta)
         self._cached_build = res
         return res
 
     def convert_to_networkx(self) -> nx.DiGraph:
         res = self._cached_build if self._cached_build is not None else self.build_topology()
+
         edges = res.edges
         cap = res.attrs.get("capacity")
         w = res.attrs.get("weight")
