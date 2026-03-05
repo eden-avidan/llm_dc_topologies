@@ -102,14 +102,14 @@ def load_workloads_from_dir(matrices_dir: Path, pattern: str = "*.csv", dtype=np
     print(f"Total {len(workloads)} workloads from {matrices_dir}")
     return workloads
     
-def run_one_workload_on_fattree(workloads: dict, workload_name: str, *, switch_ports=64, down_ports=None):
+def run_one_workload_on_fattree(workloads: dict, workload_name: str, *, switch_ports=64, down_ports=None, num_gpus=0):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
     ft = FatTree(num_nodes=n, switch_ports=switch_ports, down_ports=down_ports, link_capacity=1.0, link_weight=1.0)
     G = ft.convert_to_networkx()
 
-    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight")
+    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight", num_endpoints=n)
 
     # Infinite capacity => util is irrelevant; just store load
     annotate_graph_with_loads(G, edge_load, capacity=None)
@@ -127,7 +127,7 @@ def run_one_workload_on_fattree(workloads: dict, workload_name: str, *, switch_p
     )
 
 
-def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_ports=64, endpoints_per_router=8):
+def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_ports=64, endpoints_per_router=8, num_gpus=0):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
@@ -140,7 +140,7 @@ def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_po
     )
     G = hx.convert_to_networkx()
 
-    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight")
+    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight", num_endpoints=n)
 
     # Infinite capacity => util is irrelevant; just store load
     annotate_graph_with_loads(G, edge_load, capacity=None)
@@ -158,7 +158,7 @@ def run_one_workload_on_hyperx(workloads: dict, workload_name: str, *, router_po
     )
 
 
-def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, router_ports=64, inter_group_variant="medium"):
+def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, router_ports=64, inter_group_variant="medium", num_gpus=0):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
@@ -175,7 +175,7 @@ def run_one_workload_on_dragonfly_plus(workloads: dict, workload_name: str, *, r
     )
     G = dfp.convert_to_networkx()
 
-    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight")
+    edge_load = assign_od_to_edges_shortest(G, OD, weight="weight", num_endpoints=n)
 
     # Infinite capacity => util is irrelevant; just store load
     annotate_graph_with_loads(G, edge_load, capacity=None)
@@ -210,7 +210,9 @@ def create_all_topologies_and_graphs(
     n = OD.shape[0]
 
     base_graphs = {
-        "Fat Tree": FatTree(num_nodes=n).convert_to_networkx(),
+        "Fat Tree": FatTree(
+            num_nodes=n
+        ).convert_to_networkx(),
         "HyperX": HyperX(
             num_nodes=n,
             router_ports=router_ports,
@@ -219,14 +221,6 @@ def create_all_topologies_and_graphs(
             link_capacity=1.0,
             link_weight=1.0,
         ).convert_to_networkx(),
-        # "HyperX_1": HyperX(
-        #     num_nodes=n,
-        #     router_ports=router_ports,
-        #     endpoints_per_router=1,
-        #     # dims computed automatically based on num_nodes and endpoints_per_router
-        #     link_capacity=1.0,
-        #     link_weight=1.0,
-        # ).convert_to_networkx(),
         "Dragonfly+": DragonflyPlus(
             num_nodes=n,
             router_ports=router_ports,
@@ -234,15 +228,8 @@ def create_all_topologies_and_graphs(
             inter_group_variant=inter_group_variant,
             link_capacity=1.0,
             link_weight=1.0
-        ).convert_to_networkx()#,
-        # "DragonflyPlus_1": DragonflyPlus(
-        #     num_nodes=n,
-        #     router_ports=router_ports,
-        #     gpus_per_leaf=1,
-        #     inter_group_variant=inter_group_variant,
-        #     link_capacity=1.0,
-        #     link_weight=1.0
-        # ).convert_to_networkx()
+        ).convert_to_networkx()
+
     }
 
     variants = [
@@ -256,7 +243,7 @@ def create_all_topologies_and_graphs(
         for topo_name, G_base in base_graphs.items():
             G = deepcopy(G_base)
             edge_load = assign_od_to_edges_shortest(
-                G, OD, weight="weight", split_equal_shortest=split_equal_shortest
+                G, OD, weight="weight", split_equal_shortest=split_equal_shortest, num_endpoints=n
             )
             annotate_graph_with_loads(G, edge_load, capacity=None)
             graphs_variant[topo_name] = G

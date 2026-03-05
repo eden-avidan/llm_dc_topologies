@@ -309,7 +309,7 @@ topologies_dict = {"fat tree": Topology_Data(Fat_Tree_latency, None),
                       "rail only": Topology_Data(Rail_Only_latency, None),
                     #   "HyperX_1": Topology_Data(HyperX_latency_1_nodes_under_switch, None),
                       "DragonFly+": Topology_Data(dragonFlyP_latency, None),
-                      "HyperX_8": Topology_Data(HyperX_latency_8_nodes_under_switch, None)
+                      "HyperX": Topology_Data(HyperX_latency_8_nodes_under_switch, None)
                       }
 
 TP_Runtimes_Table = []
@@ -336,7 +336,7 @@ def update_Runtimes_Table(table, file_name):
         "rail only": topologies_dict["rail only"].last_runtime,
         # "HyperX_1": topologies_dict["HyperX_1"].last_runtime,
         "DragonFly+": topologies_dict["DragonFly+"].last_runtime,
-        "HyperX_8": topologies_dict["HyperX_8"].last_runtime
+        "HyperX": topologies_dict["HyperX"].last_runtime
     })
 
 # latency_functions = {"fat tree": Fat_Tree_latency,
@@ -353,7 +353,7 @@ def Topology_Runtime(topology, matrix, GPUs_num):
             j_location = index_to_location(j)
             if matrix[i][j] != 0:
                 # print(f"i_location: {i_location.HBI_index}, {i_location.GPU_index}")
-                if topology == "HyperX_8":
+                if topology == "HyperX":
                     i_j_latency = topologies_dict[topology].latency_function(i_location, j_location, GPUs_num)
                 else:
                     i_j_latency = topologies_dict[topology].latency_function(i_location, j_location)
@@ -511,7 +511,7 @@ for topo_name, topo_data in topologies_dict.items():
     for i in range(GPUs_num):
         for j in range(GPUs_num):
             # HyperX_8 needs num_gpus parameter for 3D coordinate calculation
-            if topo_name == "HyperX_8":
+            if topo_name == "HyperX":
                 val = latency_func(index_to_location(i), index_to_location(j), GPUs_num)
             else:
                 val = latency_func(index_to_location(i), index_to_location(j))
@@ -544,7 +544,7 @@ for topo_name, matrix in dist_matrices.items():
         min_dist, max_dist = 0, 5
     
     # Ensure at least 7 discrete color values
-    min_colors = 7
+    min_colors = 6
     if max_dist - min_dist + 1 < min_colors:
         max_dist = min_dist + min_colors - 1
     discrete_values = list(range(min_dist, max_dist + 1))

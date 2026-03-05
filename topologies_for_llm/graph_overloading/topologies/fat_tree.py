@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 import networkx as nx
@@ -8,69 +8,59 @@ import networkx as nx
 from .abstract_topology import Topology, TopologyBuildResult
 
 
-def _is_power_of_two(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
-
-
 class FatTree(Topology):
     """
-    Radix-128 fabric with explicit 8-GPU HBI hubs, direct GPU-GPU links, AND explicit leaf-class hubs.
+    Implements the exact behavior spec:
 
-    Requirements implemented:
-      - HBI direct links: GPU_a -> GPU_b (same HBI) = 1 hop (full mesh within each 8-GPU group)
-      - HBI via hub: GPU_a -> HBI -> GPU_b = 2 hops (alternative path)
-      - Leaf-class distance is 2: GPU_i -> Leaf(offset=i%8) -> GPU_{i+8k} (within same pod)
-      - Leaves connect through spines (within pod): GPU -> Leaf -> Spine -> Leaf -> GPU (<=4 in one pod)
-      - Spines connect through super-spines when multiple pods exist (cross-pod paths become >=6)
+    Hierarchy:
+      GPU (within node via HBI mesh) -> Rail (leaf) -> Spine -> SuperSpine
 
-    Distance model:
-      - Same HBI group (consecutive 8 GPUs): 1 hop (direct GPU-GPU link)
-      - Same pod, different HBI, same leaf class: 2 hops (GPU -> Leaf -> GPU)
-      - Same pod, different leaf class: 4 hops (GPU -> Leaf -> Spine -> Leaf -> GPU)
-      - Different pods: 6+ hops (via super-spines)
+    Grouping:
+      - 8 GPUs per compute node: node_id = gpu_id // 8, inner index j = gpu_id % 8
+      - 64 nodes per "block"/rail-domain: block_id = node_id // 64
 
-    Notes:
-      - This is a port-limited model for switches (leaf/spine/super): each has <=128 incident links.
-      - HBI hubs are modeled as abstract hubs and NOT port-limited (easy to add if you want).
-      - For small sizes (e.g., 128 GPUs), we build ONE pod; super-spines are not used.
+    Links and required shortest-path hop costs (with all edge weights = 1):
+      - Same node: direct HBI GPU<->GPU edges (clique) => cost 1
+      - Same block AND same j: GPU -> rail(block,j) -> GPU => cost 2
+      - Same block AND different j: GPU -> rail -> spine(block) -> rail -> GPU => cost 4
+      - Different blocks: GPU -> rail -> spine(blockA) -> superspine -> spine(blockB) -> rail -> GPU => cost 6
+
+    Port constraints (enforced by construction):
+      - Rail: downlinks = number of nodes in its block (<=64), uplinks = 1 (<=64)
+      - Spine: downlinks = 8 rails, uplinks = 1
+      - SuperSpine: downlinks = #blocks; must be <= 128, else we raise.
     """
 
     def __init__(
         self,
-        num_nodes: int,
+        num_nodes: int,  # number of GPUs
         *,
         switch_ports: int = 128,
-        hbi_size: int = 8,
-        leaves_per_pod: int = 8,   # fixed by your stride-8 leaf rule
+        node_size: int = 8,
+        nodes_per_block: int = 64,
         link_capacity: float = 1.0,
         link_weight: float = 1.0,
-        leaf_uplinks: int = 16,    # default; must satisfy leaf_down + leaf_uplinks <= 128
     ) -> None:
         super().__init__(num_nodes)
 
         if switch_ports != 128:
             raise ValueError("This topology is specifically for radix-128 switches.")
-        if hbi_size != 8:
-            raise ValueError("This topology is specifically for HBI groups of 8.")
-        if leaves_per_pod != 8:
-            raise ValueError("This topology implements the stride-8 leaf rule, so leaves_per_pod must be 8.")
-        if self.num_nodes % hbi_size != 0:
-            raise ValueError("num_nodes must be divisible by 8 (HBI size).")
-        if not _is_power_of_two(self.num_nodes):
-            raise ValueError("num_nodes (world size) must be a power of two.")
+        if node_size != 8:
+            raise ValueError("This topology is specifically for 8-GPU compute nodes.")
+        if nodes_per_block != 64:
+            raise ValueError("This topology is specifically for 64-node blocks (rail-domains).")
+
+        if self.num_nodes % node_size != 0:
+            raise ValueError("num_nodes must be divisible by 8 (node size).")
 
         if link_capacity <= 0:
             raise ValueError("link_capacity must be > 0")
         if link_weight <= 0:
             raise ValueError("link_weight must be > 0")
 
-        if not isinstance(leaf_uplinks, int) or leaf_uplinks <= 0 or leaf_uplinks >= switch_ports:
-            raise ValueError("leaf_uplinks must be an int in [1, switch_ports-1].")
-
         self.switch_ports = int(switch_ports)
-        self.hbi_size = int(hbi_size)
-        self.leaves_per_pod = int(leaves_per_pod)
-        self.leaf_uplinks = int(leaf_uplinks)
+        self.node_size = int(node_size)
+        self.nodes_per_block = int(nodes_per_block)
         self.link_capacity = float(link_capacity)
         self.link_weight = float(link_weight)
 
@@ -78,172 +68,142 @@ class FatTree(Topology):
 
     def build_topology(self) -> TopologyBuildResult:
         n_gpus = self.num_nodes
-        P = self.switch_ports
-        H = self.hbi_size
-        L = self.leaves_per_pod  # = 8
+        H = self.node_size          # 8 GPUs per node
+        B = self.nodes_per_block    # 64 nodes per block
+        P = self.switch_ports       # 128
 
-        # ---- Pod sizing with the stride-8 leaf rule ----
-        # In a pod, leaf(offset i) must connect all GPUs with local index == i mod 8.
-        # So per-leaf downlinks = pod_size / 8.
-        # Leaf also needs uplinks to spines; enforce radix 128:
-        #   (pod_size/8) + leaf_uplinks <= 128
-        max_leaf_down = P - self.leaf_uplinks
-        max_pod_size = 8 * max_leaf_down
+        num_nodes = n_gpus // H  # compute nodes
+        num_blocks = int(np.ceil(num_nodes / B))
 
-        # Choose largest power-of-two pod_size <= max_pod_size, but not exceeding n_gpus.
-        # This keeps pods uniform and preserves your leaf rule inside each pod.
-        pod_size = 1
-        while (pod_size * 2) <= max_pod_size and (pod_size * 2) <= n_gpus:
-            pod_size *= 2
-        if pod_size < 8:
-            raise ValueError("Pod size ended up too small; check leaf_uplinks vs radix constraint.")
-        if pod_size % 8 != 0:
-            # should not happen given power-of-two and >=8
-            raise ValueError("pod_size must be divisible by 8.")
+        # SuperSpine port check: it must connect to one spine per block.
+        # (SuperSpine is a single switch in this model.)
+        if num_blocks > P:
+            raise ValueError(
+                f"Need {num_blocks} spine links into the single super-spine, "
+                f"but switch_ports=128. Reduce num_nodes or change the model."
+            )
 
-        num_pods = int(np.ceil(n_gpus / pod_size))
-
-        leaf_down = pod_size // 8  # exactly the size of each i, i+8k class inside pod
-
-        if leaf_down + self.leaf_uplinks > P:
-            raise ValueError("Radix violation: leaf_down + leaf_uplinks > 128.")
-
-        # Pick #spines per pod = leaf_uplinks so each leaf can connect to all pod spines (full bipartite).
-        spines_per_pod = self.leaf_uplinks
-
-        # Spine southbound ports used = 8 (one to each leaf) if full bipartite,
-        # but since we connect each leaf to every spine, each spine sees 8 leaf links.
-        spine_south = L  # = 8
-        spine_north = P - spine_south  # available if we need super-spines
-
-        # ---- Assign IDs ----
+        # ---- ID allocation ----
         next_id = n_gpus
 
-        # HBI hubs
-        num_hbis = n_gpus // H
-        hbi_ids = np.arange(next_id, next_id + num_hbis, dtype=np.int32)
-        next_id += num_hbis
+        # Rails: 8 rails per block (one per inner index j)
+        num_rails = num_blocks * H
+        rail_ids = np.arange(next_id, next_id + num_rails, dtype=np.int32)
+        next_id += num_rails
 
-        # Leaves and spines per pod
-        leaf_ids_by_pod: list[np.ndarray] = []
-        spine_ids_by_pod: list[np.ndarray] = []
-        for _ in range(num_pods):
-            leaf_ids = np.arange(next_id, next_id + L, dtype=np.int32)
-            next_id += L
-            spine_ids = np.arange(next_id, next_id + spines_per_pod, dtype=np.int32)
-            next_id += spines_per_pod
-            leaf_ids_by_pod.append(leaf_ids)
-            spine_ids_by_pod.append(spine_ids)
+        # One spine per block
+        spine_ids = np.arange(next_id, next_id + num_blocks, dtype=np.int32)
+        next_id += num_blocks
 
-        # Super-spines only if >1 pod
-        super_spine_ids = np.array([], dtype=np.int32)
-        if num_pods > 1:
-            total_north_links = num_pods * spines_per_pod * spine_north
-            num_super = int(np.ceil(total_north_links / P))
-            super_spine_ids = np.arange(next_id, next_id + num_super, dtype=np.int32)
-            next_id += num_super
+        # One superspine
+        superspine_id = int(next_id)
+        next_id += 1
 
         total_nodes = int(next_id)
 
-        # ---- Edges ----
-        edges_u: list[int] = []
-        edges_v: list[int] = []
+        # ---- Helpers for mapping ----
+        def block_id_of_gpu(g: int) -> int:
+            node_id = g // H
+            return node_id // B
+
+        def inner_j_of_gpu(g: int) -> int:
+            return g % H
+
+        def rail_id_of(block_id: int, j: int) -> int:
+            """
+            IMPORTANT: we make rail IDs unique per block by using:
+              rail_index = block_id * 8 + j
+            This preserves your intended behavior (rails are block-local)
+            and guarantees cross-block traffic must go via super-spine.
+            """
+            rail_index = block_id * H + j
+            return int(rail_ids[rail_index])
+
+        def spine_id_of(block_id: int) -> int:
+            return int(spine_ids[block_id])
+
+        # ---- Edge lists (directed graph stored as bidirectional edges) ----
+        edges_u: List[int] = []
+        edges_v: List[int] = []
 
         def add_bidir(u: int, v: int) -> None:
             edges_u.append(u); edges_v.append(v)
             edges_u.append(v); edges_v.append(u)
 
-        # (1) GPU <-> HBI hub (distance-2 inside HBI via hub)
-        gpu_to_hbi = np.empty(n_gpus, dtype=np.int32)
+        # (1) Intra-node HBI: full mesh among each group of 8 GPUs => cost 1 inside node
+        for node_id in range(num_nodes):
+            base = node_id * H
+            # GPUs in this node: [base .. base+7]
+            for a in range(H):
+                ga = base + a
+                for b in range(a + 1, H):
+                    gb = base + b
+                    add_bidir(int(ga), int(gb))
+
+        # (2) GPU <-> Rail links (downlinks)
+        # GPU g connects to rail(block_id(g), j(g)) => enables 2-hop same-(block,j)
         for g in range(n_gpus):
-            hid = int(hbi_ids[g // H])
-            gpu_to_hbi[g] = hid
-            add_bidir(int(g), hid)
+            blk = block_id_of_gpu(g)
+            j = inner_j_of_gpu(g)
+            rid = rail_id_of(blk, j)
+            add_bidir(int(g), rid)
 
-        # (1b) Direct GPU <-> GPU links within each HBI group (full mesh)
-        # This creates direct distance-1 links between consecutive 8 GPUs
-        for hbi_idx in range(num_hbis):
-            base_gpu = hbi_idx * H
-            # Create full mesh within the HBI group
-            for i in range(H):
-                for j in range(i + 1, H):
-                    gpu_i = base_gpu + i
-                    gpu_j = base_gpu + j
-                    if gpu_i < n_gpus and gpu_j < n_gpus:
-                        add_bidir(gpu_i, gpu_j)
+        # (3) Rail <-> Spine links (uplinks inside block)
+        # One spine per block connects to all 8 rails in that block => enables 4-hop same block, diff j
+        for blk in range(num_blocks):
+            sid = spine_id_of(blk)
+            for j in range(H):
+                rid = rail_id_of(blk, j)
+                add_bidir(rid, sid)
 
-        # (2) GPU <-> Leaf (stride-8 leaf rule inside each pod)
-        # Leaf index in pod = (local_gpu_index % 8)
-        for g in range(n_gpus):
-            pod = g // pod_size
-            if pod >= num_pods:
-                pod = num_pods - 1  # defensive
-            local = g - pod * pod_size
-            leaf_idx = int(local % 8)  # 0..7
-            lid = int(leaf_ids_by_pod[pod][leaf_idx])
-            add_bidir(int(g), lid)
+        # (4) Spine <-> SuperSpine links (cross-block)
+        # Connect every block spine to the single superspine => enables 6-hop cross-block
+        for blk in range(num_blocks):
+            sid = spine_id_of(blk)
+            add_bidir(sid, superspine_id)
 
-        # (3) Leaf <-> Spine within each pod (full bipartite)
-        # Ensures any two leaves in the pod are at distance 2 via a spine,
-        # thus GPU diameter within pod <= 4.
-        for pod in range(num_pods):
-            for lid in leaf_ids_by_pod[pod].tolist():
-                for sid in spine_ids_by_pod[pod].tolist():
-                    add_bidir(int(lid), int(sid))
-
-        # (4) Spine <-> Super-spine (if multiple pods)
-        # Round-robin assign each spine's northbound ports to super-spines.
-        if num_pods > 1:
-            ss_list = super_spine_ids.tolist()
-            rr = 0
-            for pod in range(num_pods):
-                for sid in spine_ids_by_pod[pod].tolist():
-                    for _ in range(spine_north):
-                        ssid = ss_list[rr % len(ss_list)]
-                        rr += 1
-                        add_bidir(int(sid), int(ssid))
-
+        # ---- Pack edges + attributes ----
         edges = np.column_stack(
             (np.asarray(edges_u, dtype=np.int32), np.asarray(edges_v, dtype=np.int32))
         )
-
         m = edges.shape[0]
         capacity = np.full((m,), self.link_capacity, dtype=np.float32)
         weight = np.full((m,), self.link_weight, dtype=np.float32)
 
+        # ---- Metadata ----
         meta: Dict[str, Any] = {
-            "topology": "HBILeafSpineSuperSpine128",
+            "topology": "NodeRailSpineSuperSpine128",
             "num_gpus": n_gpus,
             "switch_ports": P,
-            "hbi_size": H,
-            "num_hbis": num_hbis,
-            "pod_size": pod_size,
-            "pods": num_pods,
-            "leaves_per_pod": L,
-            "spines_per_pod": spines_per_pod,
-            "leaf_rule": "GPU g connects to leaf ( (g % pod_size) % 8 ) within its pod",
-            "distance_model": {
-                "same_hbi_group": 1,
-                "same_pod_same_leaf_class": 2,
-                "same_pod_different_leaf_class": 4,
-                "different_pods": 6,
-            },
-            "port_splits": {
-                "leaf": {"downlinks_to_gpus": leaf_down, "uplinks_to_spines": self.leaf_uplinks, "total": leaf_down + self.leaf_uplinks},
-                "spine": {"south_to_leaves": spine_south, "north_to_super": (spine_north if num_pods > 1 else 0), "total": spine_south + (spine_north if num_pods > 1 else 0)},
-                "super_spine": {"ports": P},
-                "hbi": {"to_gpus": H, "note": "modeled as hub; not port-limited"},
-            },
+            "node_size": H,
+            "nodes_per_block": B,
+            "num_compute_nodes": num_nodes,
+            "num_blocks": num_blocks,
             "counts": {
-                "total_nodes_including_hbi_and_switches": total_nodes,
-                "super_spines": int(super_spine_ids.size),
-                "direct_gpu_links_per_hbi": H * (H - 1) // 2,  # full mesh = C(8,2) = 28 per group
+                "total_nodes_including_switches": total_nodes,
+                "rails": int(num_rails),
+                "spines": int(num_blocks),
+                "superspines": 1,
+            },
+            "mapping_rules": {
+                "node_id": "node_id = gpu_id // 8",
+                "inner_index": "j = gpu_id % 8",
+                "block_id": "block_id = node_id // 64",
+                "rail_index": "rail_index = block_id * 8 + j",
+                "gpu_to_rail": "gpu -> rail(block_id(gpu), j(gpu))",
+                "rails_to_spine": "all 8 rails in block -> spine(block)",
+                "spines_to_superspine": "all spines -> superspine",
+            },
+            "distance_goals_hops": {
+                "same_node": 1,
+                "same_block_same_j": 2,
+                "same_block_diff_j": 4,
+                "diff_block": 6,
             },
             "ids": {
-                "hbi_ids": hbi_ids,
-                "leaf_ids_by_pod": leaf_ids_by_pod,
-                "spine_ids_by_pod": spine_ids_by_pod,
-                "super_spine_ids": super_spine_ids,
+                "rail_ids": rail_ids,
+                "spine_ids": spine_ids,
+                "superspine_id": superspine_id,
             },
         }
 
@@ -261,7 +221,7 @@ class FatTree(Topology):
         order = np.lexsort((edges[:, 1], edges[:, 0]))
 
         G = nx.DiGraph()
-        total_nodes = res.meta.get("counts", {}).get("total_nodes_including_hbi_and_switches", None)
+        total_nodes = res.meta.get("counts", {}).get("total_nodes_including_switches", None)
         if isinstance(total_nodes, int):
             G.add_nodes_from(range(total_nodes))
 

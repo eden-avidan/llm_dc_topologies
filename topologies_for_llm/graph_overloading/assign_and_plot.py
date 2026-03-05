@@ -1,6 +1,6 @@
 import random
-from collections import defaultdict
-
+from collections import defaultdict, deque
+from typing import Dict, Tuple, Iterable, List, Set
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -12,18 +12,72 @@ import math
 import os
 
 
+def _is_gpu(node: object, num_endpoints: int) -> bool:
+    return isinstance(node, int) and 0 <= node < num_endpoints
+
+
+def _shortest_path_no_gpu_transit(
+    G: nx.DiGraph,
+    s: int,
+    t: int,
+    *,
+    num_endpoints: int,
+    weight: str = "weight",
+) -> List[int]:
+    """
+    One shortest path from s to t where GPUs (0..num_endpoints-1) cannot be intermediate.
+    Implemented by using a filtered view where GPU nodes have no outgoing edges,
+    except the source GPU s.
+    """
+    def filter_edge(u, v) -> bool:
+        # Forbid outgoing edges from any GPU u != s
+        if _is_gpu(u, num_endpoints) and u != s:
+            return False
+        return True
+
+    H = nx.subgraph_view(G, filter_edge=filter_edge)
+    return nx.shortest_path(H, source=s, target=t, weight=weight)
+
+
+def _all_shortest_paths_no_gpu_transit(
+    G: nx.DiGraph,
+    s: int,
+    t: int,
+    *,
+    num_endpoints: int,
+    weight: str = "weight",
+) -> Iterable[List[int]]:
+    """
+    All equal-cost shortest paths from s to t where GPUs cannot be intermediate.
+    Uses the same filtered view trick.
+    """
+    def filter_edge(u, v) -> bool:
+        if _is_gpu(u, num_endpoints) and u != s:
+            return False
+        return True
+
+    H = nx.subgraph_view(G, filter_edge=filter_edge)
+    return nx.all_shortest_paths(H, source=s, target=t, weight=weight)
+
+
 def assign_od_to_edges_shortest(
     G: nx.DiGraph,
     OD_csr,
     *,
+    num_endpoints: int,
     weight: str = "weight",
     split_equal_shortest: bool = False,
-):
+) -> Dict[Tuple[int, int], float]:
     """
-    Route each nonzero OD demand on shortest paths and accumulate per-edge load.
+    Route each nonzero OD demand on shortest paths and accumulate per-edge load,
+    while forbidding intermediate GPUs (0..num_endpoints-1).
 
-    If split_equal_shortest=False (default):
-        - Uses ONE shortest path per (s,t) (NetworkX tie-break / adjacency order).
+    - GPUs may be sources and targets.
+    - But no path may *leave* any GPU other than the source GPU s.
+      (So GPUs cannot forward traffic.)
+
+    If split_equal_shortest=False:
+        - Uses ONE shortest path per (s,t) (NetworkX tie-break).
     If split_equal_shortest=True:
         - Splits demand evenly across ALL equal-cost shortest paths (ECMP-style).
 
@@ -31,6 +85,12 @@ def assign_od_to_edges_shortest(
     """
     edge_load = defaultdict(float)
     n = OD_csr.shape[0]
+
+    # Optional safety: ensure OD matches endpoints domain
+    if n > num_endpoints:
+        # You might be including switches in OD; that usually isn't desired.
+        # We won't error, just note: only 0..num_endpoints-1 are treated as GPUs.
+        pass
 
     for s in range(n):
         row_start = OD_csr.indptr[s]
@@ -42,24 +102,40 @@ def assign_od_to_edges_shortest(
         ds = OD_csr.data[row_start:row_end]
 
         for t, demand in zip(js, ds):
-            t = int(t)
-            demand = float(demand)
-            if demand <= 0 or s == t:
+            s_int = int(s)
+            t_int = int(t)
+            demand_f = float(demand)
+
+            if demand_f <= 0 or s_int == t_int:
                 continue
 
-            if not split_equal_shortest:
-                path = nx.shortest_path(G, source=s, target=t, weight=weight)
-                for u, v in zip(path[:-1], path[1:]):
-                    edge_load[(u, v)] += demand
-            else:
-                paths = list(nx.all_shortest_paths(G, source=s, target=t, weight=weight))
-                k = len(paths)
-                if k == 0:
-                    continue
-                share = demand / k
-                for path in paths:
+            # If either endpoint isn't actually in the graph, skip
+            if s_int not in G or t_int not in G:
+                continue
+
+            try:
+                if not split_equal_shortest:
+                    path = _shortest_path_no_gpu_transit(
+                        G, s_int, t_int, num_endpoints=num_endpoints, weight=weight
+                    )
                     for u, v in zip(path[:-1], path[1:]):
-                        edge_load[(u, v)] += share
+                        edge_load[(u, v)] += demand_f
+                else:
+                    paths = list(
+                        _all_shortest_paths_no_gpu_transit(
+                            G, s_int, t_int, num_endpoints=num_endpoints, weight=weight
+                        )
+                    )
+                    k = len(paths)
+                    if k == 0:
+                        continue
+                    share = demand_f / k
+                    for path in paths:
+                        for u, v in zip(path[:-1], path[1:]):
+                            edge_load[(u, v)] += share
+
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
 
     return dict(edge_load)
 
@@ -86,6 +162,39 @@ def annotate_graph_with_loads(G, edge_load, *, capacity=None):
             data["util"] = load / cap if cap > 0 else 0.0
             data["overloaded"] = data["util"] > 1.0
 
+def _single_source_shortest_path_length_no_gpu_transit(
+    G: nx.Graph | nx.DiGraph,
+    source: int,
+    *,
+    num_endpoints: int,
+) -> dict[int, int]:
+    """
+    Unweighted shortest-path lengths where GPU/endpoint nodes (0..num_endpoints-1)
+    are NOT allowed as transit nodes.
+
+    - You can start at a GPU (source)
+    - You can end at a GPU (target)
+    - But if you reach some other GPU u != source, you do NOT expand from it.
+    """
+    is_gpu = lambda x: isinstance(x, int) and 0 <= x < num_endpoints
+
+    dist: dict[int, int] = {source: 0}
+    q = deque([source])
+
+    while q:
+        u = q.popleft()
+        du = dist[u]
+
+        # If u is a GPU and not the source, it cannot forward traffic.
+        if is_gpu(u) and u != source:
+            continue
+
+        for v in G.neighbors(u):
+            if v not in dist:
+                dist[v] = du + 1
+                q.append(v)
+
+    return dist
 
 def draw_fattree_overload(G: nx.DiGraph, *, max_edges_to_draw=None, title="FatTree edge utilization"):
     """
@@ -706,17 +815,23 @@ def plot_shortest_path_heatmap(
     # Compute all-pairs shortest path lengths
     # Using unweighted shortest path (number of edges)
     dist_matrix = np.full((n, n), np.nan, dtype=float)
-    
+
     for source in node_order:
         try:
-            lengths = nx.single_source_shortest_path_length(G, source)
+            if num_endpoints is not None and isinstance(source, int) and 0 <= source < num_endpoints:
+                lengths = _single_source_shortest_path_length_no_gpu_transit(
+                    G, source, num_endpoints=num_endpoints
+                )
+            else:
+                # If you're not filtering to endpoints, fall back to vanilla behavior
+                lengths = nx.single_source_shortest_path_length(G, source)
+
             src_idx = node_to_idx[source]
             for target, length in lengths.items():
                 if target in node_to_idx:
                     tgt_idx = node_to_idx[target]
                     dist_matrix[src_idx, tgt_idx] = length
         except nx.NetworkXError:
-            # Source not in graph or other error
             continue
     
     # Determine discrete values present in the matrix
