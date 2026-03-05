@@ -17,7 +17,9 @@ from assign_and_plot import (
     plot_edge_load_percentiles_multiple,
     plot_shortest_path_heatmap,
     compute_gpu_to_gpu_delay_df,
-    load_and_compare_delay_percentiles
+    load_and_compare_delay_percentiles,
+    plot_delay_percentiles_from_csv,
+    get_edge_load_stats
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -241,13 +243,30 @@ def create_all_topologies_and_graphs(
 
     for variant_dirname, split_equal_shortest in variants:
         graphs_variant = {}
+        G_dict = {}
+        edge_loads = {}
         save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
+        max_capacity = 3.5e13
         for topo_name, G_base in base_graphs.items():
             G = deepcopy(G_base)
             edge_load = assign_od_to_edges_shortest(
                 G, OD, weight="weight", split_equal_shortest=split_equal_shortest, num_endpoints=n
             )
-            annotate_graph_with_loads(G, edge_load, capacity=None)
+
+            annotate_graph_with_loads(G, edge_load, capacity=None)  # First pass to get loads
+            stats = get_edge_load_stats(G)
+            capacity = max(max_capacity, stats['max'] * 1.5)  # 50% headroom above max load
+            max_capacity = capacity
+        
+            edge_loads[topo_name] = edge_load
+            G_dict[topo_name] = G
+
+        print(f"Using capacity={max_capacity:.2e}")
+
+        for topo_name, G_base in base_graphs.items():
+            G = G_dict[topo_name]
+            edge_load = edge_loads[topo_name]
+            annotate_graph_with_loads(G, edge_load, capacity=max_capacity)  # Re-annotate with capacity
             graphs_variant[topo_name] = G
             delay_save_dir = str(Path(save_dir) / "delay_matrices")
             os.makedirs(delay_save_dir, exist_ok=True)
@@ -262,8 +281,11 @@ def create_all_topologies_and_graphs(
                 filename=f"{topo_name.replace(' ', '_')}_{workload_name}_delay.csv",
             )
 
+        cdf_dir = str(Path(save_dir) / "cdf")
+        histogram_dir = str(Path(save_dir) / "histogram")
+        percentiles_dir = str(Path(save_dir) / "percentiles")
 
-
+        
         heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
         for topo_name, graph in graphs_variant.items():
             plot_shortest_path_heatmap(
@@ -276,10 +298,8 @@ def create_all_topologies_and_graphs(
                 filename=f"{topo_name.replace(' ', '_')}_{workload_name}.png",
             )
         
-        cdf_dir = str(Path(save_dir) / "cdf")
-        histogram_dir = str(Path(save_dir) / "histogram")
-        percentiles_dir = str(Path(save_dir) / "percentiles")
-        
+
+
         # Create directories if they don't exist
         os.makedirs(cdf_dir, exist_ok=True)
         os.makedirs(histogram_dir, exist_ok=True)
@@ -309,14 +329,20 @@ def create_all_topologies_and_graphs(
             save_dir=save_dir,
             filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
         )
-
+        
         percentiles_df = load_and_compare_delay_percentiles(
             delay_save_dir,
             workload_name=workload_name,
-            percentiles=(10, 25, 50, 60, 70, 80, 90, 95, 99),
         )
-
+        
         percentiles_df.to_csv(os.path.join(delay_save_dir, f"percentiles_{workload_name}.csv"))
+        
+        plot_delay_percentiles_from_csv(
+            os.path.join(delay_save_dir, f"percentiles_{workload_name}.csv"),
+            title=f"Delay percentiles - {workload_name} ({variant_dirname})",
+            save_dir=delay_save_dir,
+            filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
+        )
 
 
 def main() -> None:
@@ -353,7 +379,7 @@ def main() -> None:
         #         endpoints_per_router=8,
         #         inter_group_variant="medium",
         #     )
-        world_sizes = [128, 256, 512, 1024]
+        world_sizes = [1024]
         for i in world_sizes:
             chosen = next((name for name, M in workloads.items() if M.shape[0] == i), None)
             if chosen is None:

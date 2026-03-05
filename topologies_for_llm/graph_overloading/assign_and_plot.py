@@ -142,6 +142,29 @@ def assign_od_to_edges_shortest(
 
 
 
+def get_edge_load_stats(G) -> dict:
+    """
+    Get statistics about edge loads in the graph.
+    
+    Returns dict with: min, max, mean, median, total, num_edges, num_nonzero
+    """
+    loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+    if loads.size == 0:
+        return {"min": 0, "max": 0, "mean": 0, "median": 0, "total": 0, "num_edges": 0, "num_nonzero": 0}
+    
+    nonzero = loads[loads > 0]
+    return {
+        "min": float(np.min(loads)),
+        "max": float(np.max(loads)),
+        "mean": float(np.mean(loads)),
+        "median": float(np.median(loads)),
+        "total": float(np.sum(loads)),
+        "num_edges": int(loads.size),
+        "num_nonzero": int(nonzero.size),
+        "p99": float(np.percentile(loads, 99)) if loads.size > 0 else 0,
+    }
+
+
 def annotate_graph_with_loads(G, edge_load, *, capacity=None):
     """
     capacity=None means "infinite" (no overload by util). We store:
@@ -324,10 +347,11 @@ def plot_edge_load_cdf(
     loads.sort()
     y = (np.arange(1, loads.size + 1) / loads.size) * 100.0  # percent
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(14, 6))
     plt.plot(loads, y)
     plt.ylabel("Edges with load ≤ x (%)")
     plt.xlabel("Edge load (bytes in matrix window)")
+    # title = "Edge Load Comparison over 1024 GPUs"
     plt.title(title)
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
 
@@ -361,7 +385,7 @@ def plot_edge_load_cdf_multiple(
         print("No graphs provided.")
         return
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(14, 6))
     
     # Use matplotlib's default color cycle (same as histogram)
     default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -993,7 +1017,7 @@ def compute_gpu_to_gpu_delay_df(
     weight: str = "weight",
     split_equal_shortest: bool = False,
     # Delay model parameters
-    bandwidth_bytes_per_sec: float | None = None,
+    bandwidth_bytes_per_sec: float = 4e11,
     alpha_per_hop_sec: float = 0.0,
     # Edge attribute names
     load_attr: str = "load",
@@ -1094,8 +1118,6 @@ def compute_gpu_to_gpu_delay_df(
             rho = 0.0
         if rho >= 1.0:
             rho = 0.999999
-        if rho > 0:
-            print(f"rho: {rho}")
         return 1.0 / (1.0 - rho)
 
     # Iterate non-zeros in OD (CSR assumed)
@@ -1188,7 +1210,7 @@ def load_and_compare_delay_percentiles(
     delay_dir: str,
     *,
     workload_name: str,
-    percentiles: Tuple[int, ...] = (10, 25, 50, 60, 70, 80, 90, 95, 99),
+    percentiles: Tuple[int, ...] = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 99),
 ) -> pd.DataFrame:
     """
     From delay_dir, load all delay CSVs whose filename contains workload_name.
@@ -1274,3 +1296,122 @@ def load_and_compare_delay_percentiles(
     out_df.to_csv(out_path, index=False)
 
     return out_df
+
+
+def plot_delay_percentiles_from_csv(
+    csv_path: str,
+    *,
+    title: str | None = None,
+    use_log_y: bool = True,
+    connect_points: bool = True,
+    save_dir: str | None = None,
+    filename: str | None = None,
+) -> None:
+    """
+    Generate a percentile plot from a delay summary CSV file.
+    
+    The CSV is expected to have columns:
+      - file: filename (used to extract topology name)
+      - p10, p25, p50, p60, p70, p80, p90, p95, p99: percentile values
+    
+    Args:
+        csv_path: Path to the percentile summary CSV file.
+        title: Plot title. If None, derived from CSV filename.
+        use_log_y: Whether to use log scale on y-axis.
+        connect_points: Whether to connect percentile points with lines.
+        save_dir: Directory to save the plot. If None, uses same directory as CSV.
+        filename: Output filename. If None, derived from CSV filename.
+    """
+    csv_path = os.path.expanduser(str(csv_path))
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path!r}")
+    
+    df = pd.read_csv(csv_path)
+    
+    if "file" not in df.columns:
+        raise ValueError("CSV must have a 'file' column")
+    
+    # Find percentile columns (p10, p25, etc.)
+    pct_cols = [c for c in df.columns if c.startswith("p") and c[1:].isdigit()]
+    if not pct_cols:
+        raise ValueError("No percentile columns (p10, p25, etc.) found in CSV")
+    
+    # Extract percentile values from column names
+    percentiles = sorted([int(c[1:]) for c in pct_cols])
+    
+    # Extract topology names from filenames
+    # Expected format: "TopologyName_workload_delay.csv" -> "TopologyName"
+    def extract_topology(filename: str) -> str:
+        # Remove _delay.csv suffix if present
+        name = filename.replace("_delay.csv", "")
+        # Take the part before the first underscore that looks like a workload identifier
+        parts = name.split("_")
+        # Common topology names
+        known_topos = ["Fat_Tree", "Fat Tree", "Dragonfly+", "HyperX", "Rail_Only"]
+        for topo in known_topos:
+            if name.startswith(topo.replace(" ", "_")):
+                return topo.replace("_", " ")
+        # Fallback: use first part
+        return parts[0].replace("_", " ")
+    
+    df["topology"] = df["file"].apply(extract_topology)
+    
+    # Generate title if not provided
+    if title is None:
+        csv_basename = os.path.basename(csv_path)
+        # Extract workload name from "delay_summary_WORKLOAD.csv"
+        if csv_basename.startswith("delay_summary_"):
+            workload = csv_basename.replace("delay_summary_", "").replace(".csv", "")
+            title = f"Delay Percentiles - {workload}"
+        else:
+            title = f"Delay Percentiles - {csv_basename}"
+    
+    # Plot setup
+    plt.figure(figsize=(12, 7))
+    
+    # Use matplotlib's default color cycle
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
+    
+    for idx, (_, row) in enumerate(df.iterrows()):
+        topo_name = row["topology"]
+        # Convert from seconds to milliseconds
+        percentile_values = [row[f"p{p}"] * 1000 for p in percentiles]
+        
+        marker = markers[idx % len(markers)]
+        color = default_colors[idx % len(default_colors)]
+        
+        if connect_points:
+            plt.plot(percentiles, percentile_values, color=color, label=topo_name,
+                     linewidth=2, marker=marker, markersize=8)
+        else:
+            plt.scatter(percentiles, percentile_values, color=color, label=topo_name,
+                        marker=marker, s=80)
+    
+    plt.xlabel("Percentile (%)")
+    plt.ylabel("Delay (µs)")
+    plt.title(title)
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.legend(loc='upper right')  # Move legend to upper right since high values are now on left
+    
+    # Set x-axis ticks to the percentiles (reversed: highest on left, lowest on right)
+    plt.xticks(percentiles)
+    plt.xlim(max(percentiles) + 5, min(percentiles) - 5)  # Reversed: high to low
+    
+    if use_log_y:
+        plt.yscale("log")
+    
+    # Determine save location
+    if save_dir is None:
+        save_dir = os.path.dirname(csv_path)
+    
+    if filename is None:
+        csv_basename = os.path.basename(csv_path)
+        filename = csv_basename.replace(".csv", ".png").replace("delay_summary_", "delay_percentiles_")
+    
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, filename)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    
+    print(f"📊 Saved delay percentiles plot: {out_path}")

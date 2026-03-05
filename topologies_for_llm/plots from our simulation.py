@@ -177,6 +177,12 @@ for filename in PKL_FILES:
     plt.close()
 
     print(f"✅ Saved scatter plot: {scatter_filename}")
+    
+    # Save scatter plot data to CSV
+    scatter_csv_filename = os.path.join(strategy_dir, f"scatter_{name}.csv")
+    scatter_df = total_runtime_df[["file"] + TOPOLOGY_COLS].copy()
+    scatter_df.to_csv(scatter_csv_filename, index=False)
+    print(f"📄 Saved scatter CSV: {scatter_csv_filename}")
 
     #%% split by num of GPUs:
 
@@ -281,6 +287,11 @@ for filename in PKL_FILES:
         plt.close()
 
         print(f"  ✅ Saved histogram for world_size={size}: {hist_filename}")
+        
+        # Save histogram data to CSV
+        hist_csv_filename = os.path.join(strategy_dir, f"histogram_world_size_{size}.csv")
+        plot_data.to_csv(hist_csv_filename, index_label="bin_range")
+        print(f"  📄 Saved histogram CSV: {hist_csv_filename}")
 
 print("\n" + "="*60)
 print("✅ All plots generated successfully!")
