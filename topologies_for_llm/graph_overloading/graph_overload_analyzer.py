@@ -5,8 +5,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import os
 import sys
+import re
+from typing import Tuple
 from pathlib import Path
 from copy import deepcopy
+import numpy as np
+from scipy import sparse
+
 
 from assign_and_plot import (
     annotate_graph_with_loads,
@@ -19,7 +24,9 @@ from assign_and_plot import (
     compute_gpu_to_gpu_delay_df,
     load_and_compare_delay_percentiles,
     plot_delay_percentiles_from_csv,
-    get_edge_load_stats
+    get_edge_load_stats,
+    plot_average_delay_percentiles_from_dir,
+    plot_average_cdf_from_csvs
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -41,11 +48,47 @@ Assumptions:
 - Zeros are common (sparse-friendly).
 """
 
-import argparse
-from typing import Dict, Tuple
+def extract_dims_for_hyperx_based_on_parallelism(workload_name: str, num_gpus: int) -> Tuple[int, int, int]:
+    """
+    Parse tp/pp from workload_name and return HyperX dims:
+      (tp/8, pp, num_gpus / ((tp/8) * pp))
 
-import numpy as np
-from scipy import sparse
+    Expected workload_name format includes tokens like:
+      "...-world_size1024-tp16-pp4-ep16-..."
+    """
+    tp_match = re.search(r"-tp(\d+)-", workload_name)
+    pp_match = re.search(r"-pp(\d+)-", workload_name)
+
+    if tp_match is None or pp_match is None:
+        raise ValueError(
+            f"Could not parse tp/pp from workload_name={workload_name!r}. "
+            "Expected tokens like '-tp16-' and '-pp4-'."
+        )
+
+    tp = int(tp_match.group(1))
+    pp = int(pp_match.group(1))
+    if tp <= 0 or pp <= 0:
+        raise ValueError(f"tp and pp must be > 0 (got tp={tp}, pp={pp})")
+
+    if tp % 8 != 0:
+        raise ValueError(f"tp must be divisible by 8 for HyperX dim calc (got tp={tp})")
+
+    tp_over_8 = tp // 8
+    denom = tp * pp
+    if denom <= 0:
+        raise ValueError(
+            f"Invalid denominator in HyperX dim calc: (tp/8)*pp={denom} "
+            f"(tp={tp}, pp={pp})"
+        )
+
+    if num_gpus % denom != 0:
+        raise ValueError(
+            f"num_gpus must be divisible by (tp/8)*pp for integer HyperX dims: "
+            f"num_gpus={num_gpus}, tp={tp}, pp={pp}, denominator={denom}"
+        )
+
+    dim3 = num_gpus // denom
+    return (tp_over_8, pp, dim3)
 
 
 def load_csv_to_csr(csv_path: Path, dtype=np.float32, return_labels: bool = False):
@@ -221,7 +264,7 @@ def create_all_topologies_and_graphs(
             num_nodes=n,
             router_ports=router_ports,
             endpoints_per_router=8,
-            # dims computed automatically based on num_nodes and endpoints_per_router
+            dims=extract_dims_for_hyperx_based_on_parallelism(workload_name, n),
             link_capacity=1.0,
             link_weight=1.0,
         ).convert_to_networkx(),
@@ -237,7 +280,7 @@ def create_all_topologies_and_graphs(
     }
 
     variants = [
-        ("single_path", False),
+        # ("single_path", False),
         ("equal_spread", True),
     ]
 
@@ -246,7 +289,10 @@ def create_all_topologies_and_graphs(
         G_dict = {}
         edge_loads = {}
         save_dir = str(Path(root_save_dir) / workload_type / variant_dirname)
+        delay_save_dir = str(Path(save_dir) / "delay_matrices")
+        os.makedirs(delay_save_dir, exist_ok=True)
         max_capacity = 3.5e13
+        
         for topo_name, G_base in base_graphs.items():
             G = deepcopy(G_base)
             edge_load = assign_od_to_edges_shortest(
@@ -257,35 +303,35 @@ def create_all_topologies_and_graphs(
             stats = get_edge_load_stats(G)
             capacity = max(max_capacity, stats['max'] * 1.5)  # 50% headroom above max load
             max_capacity = capacity
-        
+            graphs_variant[topo_name] = G
             edge_loads[topo_name] = edge_load
             G_dict[topo_name] = G
-
         print(f"Using capacity={max_capacity:.2e}")
 
+
+        
         for topo_name, G_base in base_graphs.items():
             G = G_dict[topo_name]
             edge_load = edge_loads[topo_name]
             annotate_graph_with_loads(G, edge_load, capacity=max_capacity)  # Re-annotate with capacity
             graphs_variant[topo_name] = G
-            delay_save_dir = str(Path(save_dir) / "delay_matrices")
-            os.makedirs(delay_save_dir, exist_ok=True)
+
             df_delay = compute_gpu_to_gpu_delay_df(
                 G,
                 OD,
                 num_endpoints=n,
-                split_equal_shortest=split_equal_shortest,           # match your variant
+                split_equal_shortest=False,           # match your variant
                 bandwidth_bytes_per_sec=50e9,        # example: 50 GB/s (set your own)
                 alpha_per_hop_sec=0.0,               # optional
                 save_dir=delay_save_dir,
                 filename=f"{topo_name.replace(' ', '_')}_{workload_name}_delay.csv",
             )
-
+        
         cdf_dir = str(Path(save_dir) / "cdf")
         histogram_dir = str(Path(save_dir) / "histogram")
         percentiles_dir = str(Path(save_dir) / "percentiles")
 
-        
+        '''
         heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
         for topo_name, graph in graphs_variant.items():
             plot_shortest_path_heatmap(
@@ -299,12 +345,12 @@ def create_all_topologies_and_graphs(
             )
         
 
-
+        '''
         # Create directories if they don't exist
         os.makedirs(cdf_dir, exist_ok=True)
         os.makedirs(histogram_dir, exist_ok=True)
         os.makedirs(percentiles_dir, exist_ok=True)
-        
+
         plot_edge_load_cdf_multiple(
             graphs_variant,
             title=f"Edge-load CDF - {workload_name} ({variant_dirname})",
@@ -314,22 +360,6 @@ def create_all_topologies_and_graphs(
             filename=os.path.join(cdf_dir, f"cdf_{workload_name}.png"),
         )
 
-        plot_edge_load_bucket_hist_multiple(
-            graphs_variant,
-            title=f"Edge-load bucket histogram - {workload_name} ({variant_dirname})",
-            include_zeros=include_zeros,
-            save_dir=save_dir,
-            filename=os.path.join(histogram_dir, f"histogram_{workload_name}.png"),
-        )
-
-        plot_edge_load_percentiles_multiple(
-            graphs_variant,
-            title=f"Edge-load percentiles - {workload_name} ({variant_dirname})",
-            include_zeros=include_zeros,
-            save_dir=save_dir,
-            filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
-        )
-        
         percentiles_df = load_and_compare_delay_percentiles(
             delay_save_dir,
             workload_name=workload_name,
@@ -343,15 +373,20 @@ def create_all_topologies_and_graphs(
             save_dir=delay_save_dir,
             filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
         )
-
+        
 
 def main() -> None:
-    matrices_dirs = [matrices_moe, matrices]
+    matrices_dirs = [matrices]
     workload_types = ["dense"]
 
     for matrices_dir, workload_type in zip(matrices_dirs, workload_types):
         print(f"\n=== Loading {workload_type} from {matrices_dir} ===")
         workloads = load_workloads_from_dir(Path(matrices_dir))
+        workloads = {
+            name: M
+            for name, M in workloads.items()
+            if ("tp1" not in name and "tp2" not in name and "tp4" not in name)
+        }
 
         # quick summary (optional)
         for name, M in list(workloads.items())[:5]:
@@ -363,6 +398,25 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
+        # plot_average_cdf_from_csvs(
+        #     csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
+        #     world_size=1024,
+        #     title=f"Average Edge-load CDF (1024 GPUs)",
+        #     use_log_x=True,
+        #     save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
+        #     filename=f"average_cdf_1024gpus.png",
+        # )
+
+        # plot_average_delay_percentiles_from_dir(
+        #     csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
+        #     num_gpus=1024,
+        #     title=f"Average Delay Percentiles (1024 GPUs)",
+        #     use_log_y=True,
+        #     connect_points=True,
+        #     save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
+        #     filename=f"average_delay_percentiles_1024gpus.png",
+        # )
+        # exit(0)
         # base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
         # total_workloads = len(workloads)
         # for i, workload_name in enumerate(workloads.keys()):
@@ -380,23 +434,28 @@ def main() -> None:
         #         inter_group_variant="medium",
         #     )
         world_sizes = [1024]
-        for i in world_sizes:
-            chosen = next((name for name, M in workloads.items() if M.shape[0] == i), None)
-            if chosen is None:
-                print("No workload with world_size=128 found, using first available.")
-                chosen = next(iter(workloads.keys()))
-
-            create_all_topologies_and_graphs(
-                workloads,
-                chosen,
-                workload_type=workload_type,
-                root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-                switch_ports=128,
-                down_ports=None,
-                router_ports=128,
-                endpoints_per_router=8,
-                inter_group_variant="medium",
-            )
+        for world_size in world_sizes:
+            # Find ALL workloads that match this world size
+            matching_workloads = [name for name, M in workloads.items() if M.shape[0] == world_size]
+            
+            if not matching_workloads:
+                print(f"No workload with world_size={world_size} found, skipping.")
+                continue
+            
+            print(f"Found {len(matching_workloads)} workloads with world_size={world_size}")
+            
+            for chosen in matching_workloads:
+                create_all_topologies_and_graphs(
+                    workloads,
+                    chosen,
+                    workload_type=workload_type,
+                    root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
+                    switch_ports=128,
+                    down_ports=None,
+                    router_ports=128,
+                    endpoints_per_router=8,
+                    inter_group_variant="medium",
+                )
 
 if __name__ == "__main__":
     main()

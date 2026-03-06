@@ -374,6 +374,8 @@ def plot_edge_load_cdf_multiple(
 ):
     """
     Plots: percent of edges with load <= x  (empirical CDF) for multiple graphs.
+    If save_dir is provided, the CSV stores the exact (load, cdf_percent) points
+    used for plotting, including the left anchor segment.
 
     Args:
         graphs_dict: Dictionary mapping string labels to NetworkX graphs. Each edge must have attribute 'load' (float).
@@ -410,6 +412,9 @@ def plot_edge_load_cdf_multiple(
         global_min_positive = 1.0  # fallback
     global_x_start = global_min_positive / 10 if use_log_x else max(0, global_min_positive - 1)
     
+    # Keep exact plotted points so saved CSV reproduces the rendered curves.
+    plotted_rows = []
+
     for idx, (label, G) in enumerate(graphs_dict.items()):
         loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
 
@@ -469,11 +474,23 @@ def plot_edge_load_cdf_multiple(
         plt.plot(plot_x, plot_y, color=color, label=label, linewidth=2, 
                  marker=marker, markersize=5, markevery=markevery)
 
-    plt.ylabel("Edges with load ≤ x (%)")
-    plt.xlabel("Edge load (bytes in matrix window)")
-    plt.title(title)
+        for point_idx, (xv, yv) in enumerate(zip(plot_x, plot_y)):
+            plotted_rows.append({
+                "topology": label,
+                "point_idx": int(point_idx),
+                "load": float(xv),
+                "cdf_percent": float(yv),
+                "num_edges": int(loads.size),
+                "num_zeros": int(num_zeros),
+                "first_positive_load": float(first_positive),
+                "global_x_start": float(global_x_start),
+            })
+
+    plt.ylabel("Edges with load ≤ x (%)", fontsize=16)
+    plt.xlabel("Edge load (bytes in matrix window)", fontsize=16)
+    plt.title(title, fontsize=18)
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.legend()
+    plt.legend(fontsize=13)
 
     if use_log_x:
         # log scale helps when loads span orders of magnitude
@@ -485,8 +502,278 @@ def plot_edge_load_cdf_multiple(
         out_name = filename if filename is not None else f"{title}.png"
         plt.savefig(os.path.join(save_dir, out_name), dpi=200, bbox_inches="tight")
         plt.close()
+        
+        # Save exact plotted CDF curve data as CSV (matches what was rendered).
+        csv_out_name = out_name.replace(".png", ".csv")
+        csv_path = os.path.join(save_dir, csv_out_name)
+        pd.DataFrame(plotted_rows).to_csv(csv_path, index=False)
+        print(f"📄 Saved CDF data CSV: {csv_path}")
     else:
         plt.show()
+
+
+def plot_average_cdf_from_csvs(
+    csv_dir: str,
+    *,
+    world_size: str,
+    title: str | None = None,
+    use_log_x: bool = True,
+    save_dir: str | None = None,
+    filename: str | None = None,
+) -> None:
+    """
+    Load all CDF CSV files from csv_dir that match the given world_size,
+    average the exact plotted curve points per topology, and plot the averaged CDF.
+    Preferred input schema is the one saved by plot_edge_load_cdf_multiple:
+      [topology, point_idx, load, cdf_percent]
+    Legacy sampled schemas are also supported.
+    
+    Args:
+        csv_dir: Path to directory containing cdf_*.csv files.
+        world_size: World size to filter by (e.g., "1024"). Only CSVs with
+                    "world_size{world_size}" in filename are included.
+        title: Plot title. If None, auto-generated.
+        use_log_x: Whether to use log scale on x-axis.
+        save_dir: Directory to save the plot. If None, uses csv_dir.
+        filename: Output filename. If None, auto-generated.
+    """
+    csv_dir = os.path.expanduser(str(csv_dir))
+    if not os.path.isdir(csv_dir):
+        raise FileNotFoundError(f"Directory not found: {csv_dir!r}")
+    
+    # Find all CDF CSVs matching the world size
+    world_size_pattern = f"world_size{world_size}"
+    pattern = os.path.join(csv_dir, "cdf_*.csv")
+    all_files = sorted(glob.glob(pattern))
+    
+    files = [f for f in all_files if world_size_pattern in os.path.basename(f)]
+    
+    if not files:
+        raise FileNotFoundError(
+            f"No cdf_*.csv files found with '{world_size_pattern}' in filename. "
+            f"Found {len(all_files)} total CDF CSVs in {csv_dir!r}"
+        )
+    
+    print(f"📂 Found {len(files)} CDF CSV(s) with world_size={world_size}")
+    
+    # Load all per-workload CSV curves and normalize to a common schema:
+    # [topology, point_idx, load, cdf_percent]
+    # Then average point-by-point on (topology, point_idx).
+    normalized_parts: List[pd.DataFrame] = []
+
+    for csv_path in files:
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: {e}")
+            continue
+
+        # New exact-curve format (preferred)
+        if {"topology", "point_idx", "load", "cdf_percent"}.issubset(df.columns):
+            part = df[["topology", "point_idx", "load", "cdf_percent"]].copy()
+            part["point_idx"] = part["point_idx"].astype(int)
+            part["load"] = part["load"].astype(float)
+            part["cdf_percent"] = part["cdf_percent"].astype(float)
+            normalized_parts.append(part)
+            continue
+
+        # Legacy sampled format
+        if {"topology", "load", "cdf_percent"}.issubset(df.columns):
+            part = df[["topology", "load", "cdf_percent"]].copy()
+            part["load"] = part["load"].astype(float)
+            part["cdf_percent"] = part["cdf_percent"].astype(float)
+            part = part.sort_values(["topology", "cdf_percent", "load"]).reset_index(drop=True)
+            part["point_idx"] = part.groupby("topology").cumcount()
+            normalized_parts.append(part[["topology", "point_idx", "load", "cdf_percent"]])
+            continue
+
+        if {"topology", "percentile", "load"}.issubset(df.columns):
+            part = df[["topology", "percentile", "load"]].copy()
+            part["load"] = part["load"].astype(float)
+            part["cdf_percent"] = part["percentile"].astype(float)
+            part = part.sort_values(["topology", "cdf_percent", "load"]).reset_index(drop=True)
+            part["point_idx"] = part.groupby("topology").cumcount()
+            normalized_parts.append(part[["topology", "point_idx", "load", "cdf_percent"]])
+            continue
+
+        print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: unsupported CSV schema")
+
+    if not normalized_parts:
+        raise RuntimeError("No valid data found in any CSV files")
+
+    all_df = pd.concat(normalized_parts, ignore_index=True)
+
+    # Average exact plotted points by topology and point index.
+    grouped = (
+        all_df.groupby(["topology", "point_idx"], as_index=False)
+        .agg(
+            avg_load=("load", "mean"),
+            avg_cdf_percent=("cdf_percent", "mean"),
+            count=("load", "count"),
+        )
+    )
+
+    # For log-x plotting of zeros, track raw minimum positive load per topology.
+    topo_min_positive_raw: Dict[str, float] = {}
+    for topo_name, sub in all_df.groupby("topology"):
+        positive = sub.loc[sub["load"] > 0, "load"]
+        if not positive.empty:
+            topo_min_positive_raw[topo_name] = float(positive.min())
+
+    topo_avg_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+    for topo_name, sub in grouped.groupby("topology"):
+        sub = sub.sort_values("point_idx")
+        loads_arr = sub["avg_load"].to_numpy(dtype=float)
+        cdf_arr = sub["avg_cdf_percent"].to_numpy(dtype=float)
+        # Enforce monotonic non-decreasing curves:
+        # each point is max(current averaged value, previous point).
+        loads_arr = np.maximum.accumulate(loads_arr)
+        cdf_arr = np.maximum.accumulate(np.clip(cdf_arr, 0.0, 100.0))
+        topo_avg_data[topo_name] = (loads_arr, cdf_arr)
+    
+    # Generate title
+    if title is None:
+        title = f"Average Edge-load CDF ({world_size} GPUs, {len(files)} workloads)"
+    
+    # Plot
+    plt.figure(figsize=(14, 6))
+    
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
+    
+    # Calculate global x-axis range with padding (for plotted values)
+    all_loads = []
+    for topo_name, (loads, _) in topo_avg_data.items():
+        if use_log_x:
+            topo_min = topo_min_positive_raw.get(topo_name, None)
+            if topo_min is not None and topo_min > 0:
+                loads_for_plot = np.where(loads > 0, loads, topo_min / 2.0)
+            else:
+                loads_for_plot = np.where(loads > 0, loads, 1.0)
+        else:
+            loads_for_plot = loads
+        positive_loads = loads_for_plot[loads_for_plot > 0]
+        if len(positive_loads) > 0:
+            all_loads.extend(positive_loads)
+    
+    if len(all_loads) > 0:
+        x_min = min(all_loads)
+        x_max = max(all_loads)
+        if use_log_x:
+            # For log scale, extend by factors
+            x_min = x_min / 2  # Extend left
+            x_max = x_max * 2   # Extend right
+        else:
+            # For linear scale, extend by percentage
+            x_range = x_max - x_min
+            x_min = max(0, x_min - x_range * 0.1)  # Extend left by 10%
+            x_max = x_max + x_range * 0.1          # Extend right by 10%
+    else:
+        x_min = 0.0
+        x_max = 1.0
+    
+    topo_order = ["Fat Tree", "HyperX", "Dragonfly+"]
+    ordered_topologies = [t for t in topo_order if t in topo_avg_data]
+    ordered_topologies.extend(sorted([t for t in topo_avg_data if t not in topo_order]))
+    
+    for idx, topo_name in enumerate(ordered_topologies):
+        loads, pcts = topo_avg_data[topo_name]
+        marker = markers[idx % len(markers)]
+        color = default_colors[idx % len(default_colors)]
+        if use_log_x:
+            topo_min = topo_min_positive_raw.get(topo_name, None)
+            if topo_min is not None and topo_min > 0:
+                plot_loads = np.where(loads > 0, loads, topo_min / 2.0)
+            else:
+                plot_loads = np.where(loads > 0, loads, 1.0)
+        else:
+            plot_loads = loads
+
+        # Spread markers visually evenly across x-axis (especially on log scale).
+        num_markers = 30
+        if len(plot_loads) > num_markers:
+            if use_log_x:
+                positive_mask = plot_loads > 0
+                if np.any(positive_mask):
+                    log_x = np.log10(np.maximum(plot_loads, 1e-12))
+                    log_min = log_x[positive_mask].min()
+                    log_max = log_x[positive_mask].max()
+                    if log_max > log_min:
+                        log_targets = np.linspace(log_min, log_max, num_markers)
+                        marker_indices = []
+                        for target in log_targets:
+                            idx_nearest = int(np.argmin(np.abs(log_x - target)))
+                            if idx_nearest not in marker_indices:
+                                marker_indices.append(idx_nearest)
+                        markevery = marker_indices
+                    else:
+                        markevery = max(1, len(plot_loads) // num_markers)
+                else:
+                    markevery = max(1, len(plot_loads) // num_markers)
+            else:
+                markevery = max(1, len(plot_loads) // num_markers)
+        else:
+            markevery = 1
+
+        plt.plot(
+            plot_loads,
+            pcts,
+            color=color,
+            label=topo_name,
+            linewidth=2,
+            marker=marker,
+            markersize=6,
+            markevery=markevery,
+        )
+    
+    plt.ylabel("Edges with load ≤ x (%)", fontsize=16)
+    plt.xlabel("Edge load (bytes in matrix window)", fontsize=16)
+    plt.title(title, fontsize=18)
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.legend(fontsize=13)
+    
+    if use_log_x:
+        plt.xscale("log")
+        plt.xlim(x_min, x_max)
+    else:
+        plt.xlim(x_min, x_max)
+    
+    # Y-axis from 0 to 100 (with small padding for visual clarity)
+    plt.ylim(-2, 102)
+    
+    # Determine save location
+    if save_dir is None:
+        save_dir = csv_dir
+    
+    if filename is None:
+        filename = f"avg_cdf_{world_size}gpus.png"
+    
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, filename)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    
+    print(f"📊 Saved average CDF plot: {out_path}")
+    
+    # Also save the averaged data as CSV (aligned with plotted curve points)
+    csv_out_path = out_path.replace(".png", ".csv")
+    csv_rows = []
+    for topo_name in ordered_topologies:
+        loads, pcts = topo_avg_data[topo_name]
+        sub = grouped[grouped["topology"] == topo_name].set_index("point_idx")
+        for point_idx, (load, pct) in enumerate(zip(loads, pcts)):
+            cnt = int(sub.loc[point_idx, "count"]) if point_idx in sub.index else 0
+            csv_rows.append({
+                "topology": topo_name,
+                "point_idx": int(point_idx),
+                "cdf_percent": float(pct),
+                "avg_load": float(load),
+                "count": cnt,
+            })
+    
+    pd.DataFrame(csv_rows).to_csv(csv_out_path, index=False)
+    print(f"📄 Saved average CDF data CSV: {csv_out_path}")
 
 
 def plot_edge_load_percentiles_multiple(
@@ -1210,7 +1497,7 @@ def load_and_compare_delay_percentiles(
     delay_dir: str,
     *,
     workload_name: str,
-    percentiles: Tuple[int, ...] = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 99),
+    percentiles: Tuple[int, ...] = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100),
 ) -> pd.DataFrame:
     """
     From delay_dir, load all delay CSVs whose filename contains workload_name.
@@ -1415,3 +1702,227 @@ def plot_delay_percentiles_from_csv(
     plt.close()
     
     print(f"📊 Saved delay percentiles plot: {out_path}")
+
+
+def plot_average_delay_percentiles_from_dir(
+    csv_dir: str,
+    *,
+    num_gpus: str | None = None,
+    title: str | None = None,
+    use_log_y: bool = True,
+    connect_points: bool = True,
+    save_dir: str | None = None,
+    filename: str | None = None,
+) -> None:
+    """
+    Generate a percentile plot by averaging normalized delay values across multiple
+    delay summary CSV files in a directory.
+    
+    For each CSV:
+      1. Extract topology names from each row
+      2. Normalize percentile values by dividing by the max value in that CSV
+      3. Accumulate normalized values per topology
+    
+    Then compute the average normalized value for each topology at each percentile
+    and plot the result.
+    
+    Args:
+        csv_dir: Path to directory containing delay_summary_*.csv files.
+        num_gpus: If provided (e.g., "1024"), only include CSVs whose filename
+                  contains "world_size{num_gpus}" (e.g., "world_size1024").
+                  If None, all delay_summary CSVs are included.
+        title: Plot title. If None, auto-generated based on parameters.
+        use_log_y: Whether to use log scale on y-axis.
+        connect_points: Whether to connect percentile points with lines.
+        save_dir: Directory to save the plot. If None, uses csv_dir.
+        filename: Output filename. If None, auto-generated.
+    """
+    csv_dir = os.path.expanduser(str(csv_dir))
+    if not os.path.isdir(csv_dir):
+        raise FileNotFoundError(f"Directory not found: {csv_dir!r}")
+    
+    # Find all delay_summary CSVs
+    pattern = os.path.join(csv_dir, "delay_summary_*.csv")
+    all_files = sorted(glob.glob(pattern))
+    
+    if not all_files:
+        raise FileNotFoundError(f"No delay_summary_*.csv files found in {csv_dir!r}")
+    
+    # Filter by world size if num_gpus is provided
+    if num_gpus is not None:
+        world_size_pattern = f"world_size{num_gpus}"
+        files = [f for f in all_files if world_size_pattern in os.path.basename(f)]
+        if not files:
+            raise FileNotFoundError(
+                f"No delay_summary CSVs found with '{world_size_pattern}' in filename. "
+                f"Found {len(all_files)} total CSVs."
+            )
+    else:
+        files = all_files
+    
+    print(f"📂 Found {len(files)} delay summary CSV(s) to process")
+    
+    # Extract topology from filename
+    def extract_topology(filename: str) -> str:
+        name = filename.replace("_delay.csv", "")
+        known_topos = ["Fat_Tree", "Fat Tree", "Dragonfly+", "HyperX", "Rail_Only"]
+        for topo in known_topos:
+            if name.startswith(topo.replace(" ", "_")):
+                return topo.replace("_", " ")
+        parts = name.split("_")
+        return parts[0].replace("_", " ")
+    
+    # Accumulate normalized values per topology
+    # Structure: {topology: {percentile: [list of normalized values]}}
+    topo_values: Dict[str, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
+    all_percentiles = set()
+    
+    for csv_path in files:
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: {e}")
+            continue
+        
+        if "file" not in df.columns:
+            print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: no 'file' column")
+            continue
+        
+        # Find percentile columns
+        pct_cols = [c for c in df.columns if c.startswith("p") and c[1:].isdigit()]
+        if not pct_cols:
+            print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: no percentile columns")
+            continue
+        
+        percentiles = sorted([int(c[1:]) for c in pct_cols])
+        all_percentiles.update(percentiles)
+        
+        # Find max value in this CSV for normalization (across all topologies and percentiles)
+        max_val = 0.0
+        for _, row in df.iterrows():
+            for p in percentiles:
+                val = row.get(f"p{p}", 0)
+                if pd.notna(val) and val > max_val:
+                    max_val = val
+        
+        if max_val <= 0:
+            print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: max value is 0")
+            continue
+        
+        # Normalize and accumulate
+        for _, row in df.iterrows():
+            topo_name = extract_topology(row["file"])
+            for p in percentiles:
+                val = row.get(f"p{p}", 0)
+                if pd.notna(val):
+                    normalized = val / max_val
+                    topo_values[topo_name][p].append(normalized)
+    
+    if not topo_values:
+        raise RuntimeError("No valid data found in any CSV files")
+    
+    # Compute averages
+    percentiles = sorted(all_percentiles)
+    topo_averages: Dict[str, List[float]] = {}
+    
+    for topo_name, pct_dict in topo_values.items():
+        avg_values = []
+        for p in percentiles:
+            vals = pct_dict.get(p, [])
+            if vals:
+                avg_values.append(np.mean(vals))
+            else:
+                avg_values.append(np.nan)
+        topo_averages[topo_name] = avg_values
+    
+    # Generate title
+    if title is None:
+        if num_gpus is not None:
+            title = f"Average Normalized Delay Percentiles ({num_gpus} GPUs, {len(files)} workloads)"
+        else:
+            title = f"Average Normalized Delay Percentiles ({len(files)} workloads)"
+    
+    # Plot setup
+    plt.figure(figsize=(12, 7))
+    
+    default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']
+    
+    # Define specific order for topologies
+    topo_order = ["Fat Tree", "HyperX", "Dragonfly+"]
+    ordered_items = []
+    for topo in topo_order:
+        if topo in topo_averages:
+            ordered_items.append((topo, topo_averages[topo]))
+    # Add any remaining topologies not in the predefined order
+    for topo, avg_values in topo_averages.items():
+        if topo not in topo_order:
+            ordered_items.append((topo, avg_values))
+    
+    for idx, (topo_name, avg_values) in enumerate(ordered_items):
+        marker = markers[idx % len(markers)]
+        color = default_colors[idx % len(default_colors)]
+
+        # Keep full line, but only show markers at >=5 percentile distance.
+        marker_indices = []
+        last_marked_pct = None
+        for i, p in enumerate(percentiles):
+            if last_marked_pct is None or (p - last_marked_pct) >= 5:
+                marker_indices.append(i)
+                last_marked_pct = p
+        # Always include final point for readability.
+        if marker_indices and marker_indices[-1] != len(percentiles) - 1:
+            marker_indices.append(len(percentiles) - 1)
+        
+        # Switched axes: delay (avg_values) on x, percentile on y
+        if connect_points:
+            plt.plot(avg_values, percentiles, color=color, label=topo_name,
+                     linewidth=2, marker=marker, markersize=8, markevery=marker_indices)
+        else:
+            x_mark = [avg_values[i] for i in marker_indices if i < len(avg_values)]
+            y_mark = [percentiles[i] for i in marker_indices if i < len(avg_values)]
+            plt.scatter(x_mark, y_mark, color=color, label=topo_name,
+                        marker=marker, s=80)
+    
+    plt.xlabel("Delay (ms)", fontsize=14)
+    plt.ylabel("Percentile (%)", fontsize=14)
+    plt.title(title, fontsize=16)
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.legend(loc='lower right', fontsize=12)
+    
+    # Show major ticks every 5% on the percentile axis (even if data has 1% spacing).
+    ax = plt.gca()
+    ax.yaxis.set_major_locator(mpl.ticker.MultipleLocator(5))
+    plt.ylim(min(percentiles) - 5, max(percentiles) + 5)  # Low at bottom, high at top
+    
+    if use_log_y:
+        plt.xscale("log")  # Log scale now on x-axis (delay)
+    
+    # Determine save location
+    if save_dir is None:
+        save_dir = csv_dir
+    
+    if filename is None:
+        if num_gpus is not None:
+            filename = f"avg_delay_percentiles_{num_gpus}gpus.png"
+        else:
+            filename = "avg_delay_percentiles_all.png"
+    
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, filename)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    
+    print(f"📊 Saved average delay percentiles plot: {out_path}")
+    
+    # Also save the averaged data as CSV (using same topology order)
+    csv_out_path = out_path.replace(".png", ".csv")
+    rows = []
+    for topo_name, avg_values in ordered_items:
+        row = {"topology": topo_name}
+        for p, v in zip(percentiles, avg_values):
+            row[f"p{p}"] = v
+        rows.append(row)
+    
+    pd.DataFrame(rows).to_csv(csv_out_path, index=False)
+    print(f"📄 Saved average delay percentiles CSV: {csv_out_path}")
