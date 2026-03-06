@@ -1843,7 +1843,7 @@ def plot_average_delay_percentiles_from_dir(
             title = f"Average Normalized Delay Percentiles ({len(files)} workloads)"
     
     # Plot setup
-    plt.figure(figsize=(12, 7))
+    plt.figure(figsize=(14, 6))
     
     default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     markers = ['o', 's', '^', 'D', 'x', 'v', 'p', '*', 'h', '+', '<', '>', '8', 'P', 'X']

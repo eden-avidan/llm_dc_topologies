@@ -385,7 +385,7 @@ def main() -> None:
         workloads = {
             name: M
             for name, M in workloads.items()
-            if ("tp1" not in name and "tp2" not in name and "tp4" not in name)
+            if ("tp1-" not in name and "tp2-" not in name and "tp4-" not in name)
         }
 
         # quick summary (optional)
@@ -398,25 +398,25 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
-        # plot_average_cdf_from_csvs(
-        #     csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
-        #     world_size=1024,
-        #     title=f"Average Edge-load CDF (1024 GPUs)",
-        #     use_log_x=True,
-        #     save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
-        #     filename=f"average_cdf_1024gpus.png",
-        # )
+        plot_average_cdf_from_csvs(
+            csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
+            world_size=1024,
+            title=f"Average Edge-load CDF (1024 GPUs)",
+            use_log_x=True,
+            save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
+            filename=f"average_cdf_1024gpus.png",
+        )
 
-        # plot_average_delay_percentiles_from_dir(
-        #     csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
-        #     num_gpus=1024,
-        #     title=f"Average Delay Percentiles (1024 GPUs)",
-        #     use_log_y=True,
-        #     connect_points=True,
-        #     save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
-        #     filename=f"average_delay_percentiles_1024gpus.png",
-        # )
-        # exit(0)
+        plot_average_delay_percentiles_from_dir(
+            csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
+            num_gpus=1024,
+            title=f"Average Delay Percentiles (1024 GPUs)",
+            use_log_y=True,
+            connect_points=True,
+            save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
+            filename=f"average_delay_percentiles_1024gpus.png",
+        )
+        exit(0)
         # base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
         # total_workloads = len(workloads)
         # for i, workload_name in enumerate(workloads.keys()):
