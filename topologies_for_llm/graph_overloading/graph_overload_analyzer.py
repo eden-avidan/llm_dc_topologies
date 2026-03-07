@@ -6,7 +6,7 @@ import pandas as pd
 import os
 import sys
 import re
-from typing import Tuple
+from typing import Tuple, List
 from pathlib import Path
 from copy import deepcopy
 import numpy as np
@@ -26,7 +26,9 @@ from assign_and_plot import (
     plot_delay_percentiles_from_csv,
     get_edge_load_stats,
     plot_average_delay_percentiles_from_dir,
-    plot_average_cdf_from_csvs
+    plot_average_cdf_from_csvs,
+    save_effective_heatmap_csv,
+    save_effective_heatmap_nonzero_distribution_csv
 )
 from topologies.dragonfly_plus import DragonflyPlus
 from topologies.fat_tree import FatTree
@@ -89,8 +91,7 @@ def extract_dims_for_hyperx_based_on_parallelism(workload_name: str, num_gpus: i
 
     dim3 = num_gpus // denom
     return (tp_over_8, pp, dim3)
-
-
+    
 def load_csv_to_csr(csv_path: Path, dtype=np.float32, return_labels: bool = False):
     """
     Loads a transport matrix CSV into a CSR sparse matrix.
@@ -245,9 +246,9 @@ def create_all_topologies_and_graphs(
     *,
     workload_type: str,          # "moe" or "dense"
     root_save_dir: str,          # path to edge_load_comparisons
-    switch_ports: int = 64,
+    switch_ports: int = 128,
     down_ports: int | None = None,
-    router_ports: int = 64,
+    router_ports: int = 256,
     endpoints_per_router: int = 8,
     inter_group_variant: str = "medium",
     use_log_x: bool = True,
@@ -258,7 +259,11 @@ def create_all_topologies_and_graphs(
 
     base_graphs = {
         "Fat Tree": FatTree(
-            num_nodes=n
+            num_nodes=n,
+            switch_ports=switch_ports,
+            node_size=8,
+            link_capacity=1.0,
+            link_weight=1.0,
         ).convert_to_networkx(),
         "HyperX": HyperX(
             num_nodes=n,
@@ -308,7 +313,7 @@ def create_all_topologies_and_graphs(
             G_dict[topo_name] = G
         print(f"Using capacity={max_capacity:.2e}")
 
-
+        
         
         for topo_name, G_base in base_graphs.items():
             G = G_dict[topo_name]
@@ -331,7 +336,7 @@ def create_all_topologies_and_graphs(
         histogram_dir = str(Path(save_dir) / "histogram")
         percentiles_dir = str(Path(save_dir) / "percentiles")
 
-        '''
+        
         heatmap_save_dir = str(Path(root_save_dir) / workload_type / variant_dirname / "heatmaps")
         for topo_name, graph in graphs_variant.items():
             plot_shortest_path_heatmap(
@@ -345,7 +350,7 @@ def create_all_topologies_and_graphs(
             )
         
 
-        '''
+        
         # Create directories if they don't exist
         os.makedirs(cdf_dir, exist_ok=True)
         os.makedirs(histogram_dir, exist_ok=True)
@@ -373,6 +378,8 @@ def create_all_topologies_and_graphs(
             save_dir=delay_save_dir,
             filename=os.path.join(percentiles_dir, f"percentiles_{workload_name}.png"),
         )
+
+
         
 
 def main() -> None:
@@ -398,25 +405,36 @@ def main() -> None:
         if len(workloads) > 5:
             print(f"... ({len(workloads)-5} more)")
 
-        plot_average_cdf_from_csvs(
-            csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
-            world_size=1024,
-            title=f"Average Edge-load CDF (1024 GPUs)",
-            use_log_x=True,
-            save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
-            filename=f"average_cdf_1024gpus.png",
+        save_effective_heatmap_csv(
+            heatmaps_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "heatmaps"),
+            transport_dir="/Users/eavidan/Documents/topology_repo/simai/final_output/matrices",
+            save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "effective_heatmaps"),
         )
 
-        plot_average_delay_percentiles_from_dir(
-            csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
-            num_gpus=1024,
-            title=f"Average Delay Percentiles (1024 GPUs)",
-            use_log_y=True,
-            connect_points=True,
-            save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
-            filename=f"average_delay_percentiles_1024gpus.png",
+        save_effective_heatmap_nonzero_distribution_csv(
+            effective_heatmaps_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "effective_heatmaps"),
+            save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "effective_heatmaps_nonzero_distribution"),
         )
         exit(0)
+        # plot_average_cdf_from_csvs(
+        #     csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
+        #     world_size=1024,
+        #     title=f"Average Edge-load CDF (1024 GPUs)",
+        #     use_log_x=True,
+        #     save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "cdf"),
+        #     filename=f"average_cdf_1024gpus.png",
+        # )
+
+        # plot_average_delay_percentiles_from_dir(
+        #     csv_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
+        #     num_gpus=1024,
+        #     title=f"Average Delay Percentiles (1024 GPUs)",
+        #     use_log_y=True,
+        #     connect_points=True,
+        #     save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
+        #     filename=f"average_delay_percentiles_1024gpus.png",
+        # )
+        # exit(0)
         # base_save_path = str(os.path.join(this_dir, "edge_load_comparisons", workload_type))
         # total_workloads = len(workloads)
         # for i, workload_name in enumerate(workloads.keys()):
@@ -450,9 +468,7 @@ def main() -> None:
                     chosen,
                     workload_type=workload_type,
                     root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-                    switch_ports=128,
                     down_ports=None,
-                    router_ports=128,
                     endpoints_per_router=8,
                     inter_group_variant="medium",
                 )

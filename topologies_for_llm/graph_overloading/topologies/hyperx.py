@@ -8,46 +8,7 @@ import numpy as np
 import networkx as nx
 
 from .abstract_topology import Topology, TopologyBuildResult
-
-
-def minimal_balanced_3d_dims(num_gpus: int, gpus_per_hbi: int = 8) -> Tuple[int, int, int]:
-    """
-    Same dimension-sizing logic as your numeric HyperX implementation.
-
-    Find (Sx, Sy, Sz) such that:
-      - Sx*Sy*Sz >= routers = ceil(num_gpus/gpus_per_hbi)
-      - Volume is minimal
-      - Among minimal volumes, dims are as balanced as possible (closest to cube)
-
-    Returns dims sorted descending (Sx >= Sy >= Sz) for determinism.
-    """
-    R = ceil(num_gpus / gpus_per_hbi)
-    if R <= 1:
-        return (1, 1, 1)
-
-    best = None  # (volume, imbalance, spread, dims)
-
-    max_sz = ceil(R ** (1 / 3)) + 2
-    for Sz in range(1, max_sz + 1):
-        max_sy = ceil((R / Sz) ** 0.5) + 2
-        for Sy in range(Sz, max_sy + 1):
-            Sx = ceil(R / (Sy * Sz))
-            if Sx < Sy:
-                Sx = Sy
-
-            V = Sx * Sy * Sz
-            if V < R:
-                continue
-
-            dims = (int(Sx), int(Sy), int(Sz))
-            imbalance = Sx - Sz
-            spread = (Sx - Sy) ** 2 + (Sy - Sz) ** 2 + (Sx - Sz) ** 2
-
-            cand = (V, imbalance, spread, dims)
-            if best is None or cand < best:
-                best = cand
-
-    return best[3]
+from .. import hyperx_dimension_structures as hds
 
 
 class HyperX(Topology):
@@ -109,7 +70,7 @@ class HyperX(Topology):
         routers_min = int(ceil(n / p))
 
         # ---- DIM SELECTION (matches your numeric implementation) ----
-        dims = self.dims if self.dims is not None else minimal_balanced_3d_dims(num_gpus=n, gpus_per_hbi=p)
+        dims = self.dims if self.dims is not None else (int(ceil(n / p)), int(ceil(n / p)), int(ceil(n / p)))
         Sx, Sy, Sz = (int(dims[0]), int(dims[1]), int(dims[2]))
         R = int(Sx * Sy * Sz)
 

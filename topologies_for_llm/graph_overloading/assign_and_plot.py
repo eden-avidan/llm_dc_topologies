@@ -11,6 +11,8 @@ import seaborn as sns
 import math
 import os
 import glob
+import re
+from pathlib import Path
 
 
 def _is_gpu(node: object, num_endpoints: int) -> bool:
@@ -1294,6 +1296,291 @@ def plot_shortest_path_heatmap_multiple(
         
         if save_dir:
             print(f"✅ Saved heatmap for {label}")
+
+
+def save_effective_heatmap_csv(
+    heatmaps_dir: str,
+    transport_dir: str,
+    *,
+    save_dir: str | None = None,
+) -> List[str]:
+    """
+    Batch-create "effective heatmap" CSVs by masking each heatmap with its matching
+    transport matrix.
+
+    For each heatmap CSV in `heatmaps_dir`:
+      - infer workload name from heatmap filename (Topology_workload.csv)
+      - find matching transport CSV in `transport_dir` by workload stem
+      - keep heatmap[i, j] if transport[i, j] != 0, else set to 0
+      - save as: effective_heatmap_<original_heatmap_filename>.csv
+
+    Supports both labeled square CSVs (row/col labels) and plain numeric square CSVs.
+
+    Args:
+        heatmaps_dir: Directory containing heatmap CSV files.
+        transport_dir: Directory containing transport-matrix CSV files (workload-named).
+        save_dir: Output directory (defaults to heatmaps_dir).
+
+    Returns:
+        List of output CSV paths that were saved.
+    """
+    def _load_square_csv(path: str) -> pd.DataFrame:
+        # Try labeled CSV first (index column + header row)
+        try:
+            df = pd.read_csv(path, index_col=0)
+            df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            if df.shape[0] == df.shape[1] and df.shape[0] > 0:
+                return df
+        except Exception:
+            pass
+
+        # Fallback: plain numeric CSV with no labels
+        arr = np.loadtxt(path, delimiter=",", dtype=float)
+        if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+            raise ValueError(f"CSV must be square matrix: {path!r}, got shape={arr.shape}")
+        labels = [f"GPU{i}" for i in range(arr.shape[0])]
+        return pd.DataFrame(arr, index=labels, columns=labels)
+
+    heatmaps_dir = os.path.expanduser(str(heatmaps_dir))
+    transport_dir = os.path.expanduser(str(transport_dir))
+    if not os.path.isdir(heatmaps_dir):
+        raise FileNotFoundError(f"heatmaps_dir not found: {heatmaps_dir!r}")
+    if not os.path.isdir(transport_dir):
+        raise FileNotFoundError(f"transport_dir not found: {transport_dir!r}")
+
+    heatmap_files = sorted(glob.glob(os.path.join(heatmaps_dir, "*.csv")))
+    if not heatmap_files:
+        raise FileNotFoundError(f"No heatmap CSV files found in {heatmaps_dir!r}")
+
+    transport_files = sorted(glob.glob(os.path.join(transport_dir, "*.csv")))
+    transport_map = {Path(p).stem: p for p in transport_files}
+    if not transport_map:
+        raise FileNotFoundError(f"No transport CSV files found in {transport_dir!r}")
+
+    if save_dir is None:
+        save_dir = heatmaps_dir
+    os.makedirs(save_dir, exist_ok=True)
+
+    topo_prefixes = [
+        "Fat_Tree_",
+        "Fat Tree_",
+        "Dragonfly+_",
+        "HyperX_",
+        "Rail_Only_",
+        "Rail Only_",
+    ]
+
+    def _extract_workload_stem(heatmap_stem: str) -> str:
+        for pref in topo_prefixes:
+            if heatmap_stem.startswith(pref):
+                return heatmap_stem[len(pref):]
+        # Fallback: split once at the first underscore.
+        parts = heatmap_stem.split("_", 1)
+        return parts[1] if len(parts) == 2 else heatmap_stem
+
+    out_paths: List[str] = []
+    for heatmap_path in heatmap_files:
+        heatmap_stem = Path(heatmap_path).stem
+        workload_stem = _extract_workload_stem(heatmap_stem)
+        transport_path = transport_map.get(workload_stem)
+        if transport_path is None:
+            print(
+                f"  ⚠️ Skipping {os.path.basename(heatmap_path)}: "
+                f"no matching transport CSV for workload stem {workload_stem!r}"
+            )
+            continue
+
+        heatmap_df = _load_square_csv(heatmap_path)
+        transport_df = _load_square_csv(transport_path)
+
+        # Prefer label-based alignment when possible.
+        if (
+            set(heatmap_df.index) == set(transport_df.index)
+            and set(heatmap_df.columns) == set(transport_df.columns)
+        ):
+            transport_aligned = transport_df.loc[heatmap_df.index, heatmap_df.columns]
+        elif heatmap_df.shape == transport_df.shape:
+            # Fallback: positional alignment if dimensions match but labels don't.
+            transport_aligned = pd.DataFrame(
+                transport_df.to_numpy(dtype=float, copy=False),
+                index=heatmap_df.index,
+                columns=heatmap_df.columns,
+            )
+        else:
+            print(
+                f"  ⚠️ Skipping {os.path.basename(heatmap_path)}: "
+                f"shape mismatch heatmap={heatmap_df.shape} transport={transport_df.shape}"
+            )
+            continue
+
+        heatmap_vals = heatmap_df.to_numpy(dtype=float, copy=True)
+        transport_vals = transport_aligned.to_numpy(dtype=float, copy=False)
+        heatmap_vals[transport_vals == 0] = 0.0
+        effective_df = pd.DataFrame(heatmap_vals, index=heatmap_df.index, columns=heatmap_df.columns)
+
+        out_name = f"effective_heatmap_{os.path.basename(heatmap_path)}"
+        out_path = os.path.join(save_dir, out_name)
+        effective_df.to_csv(out_path)
+        out_paths.append(out_path)
+        print(f"📄 Saved effective heatmap CSV: {out_path}")
+
+    if not out_paths:
+        raise RuntimeError(
+            "No effective heatmaps were generated (no matches or all pairs failed alignment)."
+        )
+
+    return out_paths
+
+
+def save_effective_heatmap_nonzero_distribution_csv(
+    effective_heatmaps_dir: str,
+    *,
+    save_dir: str | None = None,
+    filename: str = "effective_heatmap_nonzero_distribution.csv",
+) -> str:
+    """
+    Aggregate non-zero effective-heatmap values across all CSVs in a directory and
+    save a distribution CSV for Fat Tree, HyperX, and Dragonfly+.
+
+    Output columns:
+      - topology
+      - value
+      - count
+      - pct_of_topology_nonzero
+      - total_nonzero_topology
+      - num_files_topology
+    """
+    effective_heatmaps_dir = os.path.expanduser(str(effective_heatmaps_dir))
+    if not os.path.isdir(effective_heatmaps_dir):
+        raise FileNotFoundError(f"effective_heatmaps_dir not found: {effective_heatmaps_dir!r}")
+
+    csv_files = sorted(glob.glob(os.path.join(effective_heatmaps_dir, "*.csv")))
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found in {effective_heatmaps_dir!r}")
+
+    target_topos = ("Fat Tree", "HyperX", "Dragonfly+")
+    topo_prefixes = {
+        "Fat Tree": ("effective_heatmap_Fat_Tree_", "effective_heatmap_Fat Tree_"),
+        "HyperX": ("effective_heatmap_HyperX_",),
+        "Dragonfly+": ("effective_heatmap_Dragonfly+_",),
+    }
+
+    topo_values: Dict[str, List[np.ndarray]] = {t: [] for t in target_topos}
+    topo_file_counts: Dict[str, int] = {t: 0 for t in target_topos}
+    # Per-world-size aggregations: world_size -> topology -> list of non-zero arrays
+    topo_values_by_ws: Dict[str, Dict[str, List[np.ndarray]]] = defaultdict(
+        lambda: {t: [] for t in target_topos}
+    )
+    topo_file_counts_by_ws: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {t: 0 for t in target_topos}
+    )
+
+    for fp in csv_files:
+        stem = Path(fp).stem
+        topo_name = None
+        for topo, prefixes in topo_prefixes.items():
+            if any(stem.startswith(pref) for pref in prefixes):
+                topo_name = topo
+                break
+        if topo_name is None:
+            continue
+
+        # Load matrix (labeled or numeric)
+        try:
+            df = pd.read_csv(fp, index_col=0)
+            arr = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float, copy=False)
+            if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+                raise ValueError("not square")
+        except Exception:
+            arr = np.loadtxt(fp, delimiter=",", dtype=float)
+            if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+                print(f"  ⚠️ Skipping {os.path.basename(fp)}: could not parse square matrix")
+                continue
+
+        flat = arr.reshape(-1)
+        flat = flat[~np.isnan(flat)]
+        nonzero = flat[flat != 0.0]
+        if nonzero.size == 0:
+            continue
+
+        topo_values[topo_name].append(nonzero)
+        topo_file_counts[topo_name] += 1
+        ws_match = re.search(r"world_size(\d+)", stem)
+        if ws_match is not None:
+            world_size = ws_match.group(1)
+            topo_values_by_ws[world_size][topo_name].append(nonzero)
+            topo_file_counts_by_ws[world_size][topo_name] += 1
+
+    rows = []
+    for topo in target_topos:
+        if not topo_values[topo]:
+            continue
+        vals = np.concatenate(topo_values[topo])
+        unique_vals, counts = np.unique(vals, return_counts=True)
+        total_nonzero = int(np.sum(counts))
+        for v, c in zip(unique_vals, counts):
+            rows.append(
+                {
+                    "topology": topo,
+                    "value": float(v),
+                    "count": int(c),
+                    "pct_of_topology_nonzero": (float(c) / total_nonzero) * 100.0,
+                    "total_nonzero_topology": total_nonzero,
+                    "num_files_topology": topo_file_counts[topo],
+                }
+            )
+
+    if not rows:
+        raise RuntimeError(
+            "No non-zero values found for Fat Tree / HyperX / Dragonfly+ in effective heatmap CSVs."
+        )
+
+    out_df = pd.DataFrame(rows).sort_values(["topology", "value"]).reset_index(drop=True)
+
+    if save_dir is None:
+        save_dir = effective_heatmaps_dir
+    os.makedirs(save_dir, exist_ok=True)
+    if not filename.lower().endswith(".csv"):
+        filename = f"{filename}.csv"
+    out_path = os.path.join(save_dir, filename)
+    out_df.to_csv(out_path, index=False)
+    print(f"📄 Saved effective heatmap non-zero distribution CSV: {out_path}")
+
+    # Save per-world-size distributions as separate CSV files.
+    base_name = filename[:-4] if filename.lower().endswith(".csv") else filename
+    for world_size in sorted(topo_values_by_ws.keys(), key=lambda x: int(x)):
+        ws_rows = []
+        ws_vals = topo_values_by_ws[world_size]
+        ws_counts = topo_file_counts_by_ws[world_size]
+
+        for topo in target_topos:
+            if not ws_vals[topo]:
+                continue
+            vals = np.concatenate(ws_vals[topo])
+            unique_vals, counts = np.unique(vals, return_counts=True)
+            total_nonzero = int(np.sum(counts))
+            for v, c in zip(unique_vals, counts):
+                ws_rows.append(
+                    {
+                        "world_size": int(world_size),
+                        "topology": topo,
+                        "value": float(v),
+                        "count": int(c),
+                        "pct_of_topology_nonzero": (float(c) / total_nonzero) * 100.0,
+                        "total_nonzero_topology": total_nonzero,
+                        "num_files_topology": ws_counts[topo],
+                    }
+                )
+
+        if not ws_rows:
+            continue
+        ws_df = pd.DataFrame(ws_rows).sort_values(["topology", "value"]).reset_index(drop=True)
+        ws_filename = f"{base_name}_world_size{world_size}.csv"
+        ws_out_path = os.path.join(save_dir, ws_filename)
+        ws_df.to_csv(ws_out_path, index=False)
+        print(f"📄 Saved effective heatmap non-zero distribution CSV (world_size={world_size}): {ws_out_path}")
+
+    return out_path
 
 
 def compute_gpu_to_gpu_delay_df(
