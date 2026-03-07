@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+Helper module for HyperX dimension/mapping checks.
+Includes Megatron filename parsing, rank-to-HyperX coordinate mapping,
+and transport-matrix hop validation utilities.
+"""
+
 import os
 import re
 import argparse
@@ -7,6 +13,48 @@ from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 import pandas as pd
+
+def extract_dims_for_hyperx_based_on_parallelism(workload_name: str, num_gpus: int) -> Tuple[int, int, int]:
+    """
+    Parse tp/pp from workload_name and return HyperX dims:
+      (tp/8, pp, num_gpus / ((tp/8) * pp))
+
+    Expected workload_name format includes tokens like:
+      "...-world_size1024-tp16-pp4-ep16-..."
+    """
+    tp_match = re.search(r"-tp(\d+)-", workload_name)
+    pp_match = re.search(r"-pp(\d+)-", workload_name)
+
+    if tp_match is None or pp_match is None:
+        raise ValueError(
+            f"Could not parse tp/pp from workload_name={workload_name!r}. "
+            "Expected tokens like '-tp16-' and '-pp4-'."
+        )
+
+    tp = int(tp_match.group(1))
+    pp = int(pp_match.group(1))
+    if tp <= 0 or pp <= 0:
+        raise ValueError(f"tp and pp must be > 0 (got tp={tp}, pp={pp})")
+
+    if tp % 8 != 0:
+        raise ValueError(f"tp must be divisible by 8 for HyperX dim calc (got tp={tp})")
+
+    tp_over_8 = tp // 8
+    denom = tp * pp
+    if denom <= 0:
+        raise ValueError(
+            f"Invalid denominator in HyperX dim calc: (tp/8)*pp={denom} "
+            f"(tp={tp}, pp={pp})"
+        )
+
+    if num_gpus % denom != 0:
+        raise ValueError(
+            f"num_gpus must be divisible by (tp/8)*pp for integer HyperX dims: "
+            f"num_gpus={num_gpus}, tp={tp}, pp={pp}, denominator={denom}"
+        )
+
+    dim3 = num_gpus // denom
+    return (tp_over_8, pp, dim3)
 
 def megatron_rank_to_hyperx_coords(tp: int, pp: int, dp: int, gpus_per_leaf: int = 8) -> List[Tuple[int, int, int]]:
     """

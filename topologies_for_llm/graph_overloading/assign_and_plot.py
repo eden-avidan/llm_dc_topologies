@@ -1,3 +1,10 @@
+"""
+Helper utilities for graph-overloading experiments:
+- load assignment/routing helpers
+- delay and edge-load calculations
+- plotting and CSV export helpers
+"""
+
 import random
 from collections import defaultdict, deque
 from typing import Dict, Tuple, Iterable, List
@@ -1390,6 +1397,13 @@ def save_effective_heatmap_csv(
             )
             continue
 
+        out_name = f"effective_heatmap_{os.path.basename(heatmap_path)}"
+        out_path = os.path.join(save_dir, out_name)
+        if os.path.isfile(out_path):
+            out_paths.append(out_path)
+            print(f"⏭️ Skipping (already exists): {out_path}")
+            continue
+
         heatmap_df = _load_square_csv(heatmap_path)
         transport_df = _load_square_csv(transport_path)
 
@@ -1418,8 +1432,6 @@ def save_effective_heatmap_csv(
         heatmap_vals[transport_vals == 0] = 0.0
         effective_df = pd.DataFrame(heatmap_vals, index=heatmap_df.index, columns=heatmap_df.columns)
 
-        out_name = f"effective_heatmap_{os.path.basename(heatmap_path)}"
-        out_path = os.path.join(save_dir, out_name)
         effective_df.to_csv(out_path)
         out_paths.append(out_path)
         print(f"📄 Saved effective heatmap CSV: {out_path}")
