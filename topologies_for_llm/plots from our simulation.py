@@ -40,15 +40,15 @@ if args.all_archs:
     output_suffix = "_all_archs"
     print("🌐 All Architectures Mode: Combining MOE and standard workloads")
 else:
-    variant = "moe" if args.moe_active else "standard"
-    paths = get_variant_paths(variant)
-    PKL_DIR = str(paths["dataframes"])
-    output_suffix = "_moe" if args.moe_active else ""
-    
-    if args.moe_active:
-        print("🔬 MOE Mode: Using MOE-enabled simulation data")
-    else:
-        print("📊 Standard Mode: Using regular simulation data")
+variant = "moe" if args.moe_active else "standard"
+paths = get_variant_paths(variant)
+PKL_DIR = str(paths["dataframes"])
+output_suffix = "_moe" if args.moe_active else ""
+
+if args.moe_active:
+    print("🔬 MOE Mode: Using MOE-enabled simulation data")
+else:
+    print("📊 Standard Mode: Using regular simulation data")
 
 # Check if directories exist
 if args.all_archs:
@@ -68,15 +68,15 @@ if args.all_archs:
     print(f"📁 Reading standard data from: {PKL_DIR_STANDARD}")
     print(f"📁 Reading MOE data from: {PKL_DIR_MOE}")
 else:
-    if not os.path.exists(PKL_DIR):
-        print(f"❌ Directory not found: {PKL_DIR}")
-        if args.moe_active:
-            print("   Make sure to run 'Topologies Runtime.py --moe-active' first to generate MOE DataFrames")
-        else:
-            print("   Make sure to run 'Topologies Runtime.py' first to generate DataFrames")
-        exit(1)
-    
-    print(f"📁 Reading data from: {PKL_DIR}")
+if not os.path.exists(PKL_DIR):
+    print(f"❌ Directory not found: {PKL_DIR}")
+    if args.moe_active:
+        print("   Make sure to run 'Topologies Runtime.py --moe-active' first to generate MOE DataFrames")
+    else:
+        print("   Make sure to run 'Topologies Runtime.py' first to generate DataFrames")
+    exit(1)
+
+print(f"📁 Reading data from: {PKL_DIR}")
 
 # List of pkl files to process
 PKL_FILES = ['only_tp.pkl', 'only_dp.pkl', 'only_pp.pkl', 'Total.pkl']
@@ -134,16 +134,16 @@ for filename in PKL_FILES:
         total_runtime_df = total_runtime_df.sort_values(by='HyperX', ascending=True)
         print(f"  Combined total: {len(total_runtime_df)} workloads")
     else:
-        filepath = os.path.join(PKL_DIR, filename)
-        
-        # Check if file exists
-        if not os.path.exists(filepath):
-            print(f"⚠️  File not found: {filepath}")
-            continue
+    filepath = os.path.join(PKL_DIR, filename)
 
-        total_runtime_df = pd.read_pickle(filepath)
-        total_runtime_df = total_runtime_df.sort_values(by='HyperX', ascending=True)
-        print(f"Loaded {len(total_runtime_df)} workloads")
+    # Check if file exists
+    if not os.path.exists(filepath):
+        print(f"⚠️  File not found: {filepath}")
+        continue
+
+    total_runtime_df = pd.read_pickle(filepath)
+    total_runtime_df = total_runtime_df.sort_values(by='HyperX', ascending=True)
+    print(f"Loaded {len(total_runtime_df)} workloads")
 
     # Create subdirectory for this parallelism strategy
     strategy_dir = os.path.join(OUTPUT_DIR, name)

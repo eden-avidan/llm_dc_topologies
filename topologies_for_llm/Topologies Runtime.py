@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import os
 import re
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import argparse
 from output_config import get_variant_paths
@@ -20,36 +21,33 @@ parser = argparse.ArgumentParser(description='Analyze topology runtime for SimAI
 parser.add_argument('--moe-active', action='store_true',
                     help='Use MOE-enabled workload data instead of regular workloads')
 parser.add_argument('--heatmaps-only', action='store_true',
-                    help='Generate only topology latency heatmaps and skip runtime/dataframe/overhead plots')
+                    help='Generate only topology latency heatmaps and skip runtime/dataframe/overhead/hop-distribution outputs')
 args = parser.parse_args()
 
 # Configure variant-specific output paths once, for all run modes
 variant = "moe" if args.moe_active else "standard"
 paths = get_variant_paths(variant)
 
-if args.heatmaps_only:
-    print("🗺️  Heatmaps-only mode: skipping workload runtime processing")
-    dirs_list = []
+# print("🗺️  Heatmaps-only mode: skipping workload runtime processing")
+# Gather data from the SimAI simulations:
+invalid_dirs = ["workload", "heatmaps", "workload_moe"]
+
+script_dir = Path(__file__).resolve().parent
+folder = (script_dir / "../simai/final_output").resolve()
+
+# Filter directories based on MOE flag
+if args.moe_active:
+    print("🔬 MOE Mode: Using MOE-enabled workload data")
+    dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name.endswith('_moe')]
 else:
-    # Gather data from the SimAI simulations:
-    invalid_dirs = ["workload", "heatmaps", "workload_moe"]
+    print("📊 Standard Mode: Using regular workload data")
+    dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name not in invalid_dirs and not p.name.endswith('_moe')]
 
-    script_dir = Path(__file__).resolve().parent
-    folder = (script_dir / "../simai/final_output").resolve()
-
-    # Filter directories based on MOE flag
+if not dirs_list:
+    print(f"❌ No directories found in {folder}")
     if args.moe_active:
-        print("🔬 MOE Mode: Using MOE-enabled workload data")
-        dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name.endswith('_moe')]
-    else:
-        print("📊 Standard Mode: Using regular workload data")
-        dirs_list = [p for p in folder.iterdir() if p.is_dir() and p.name not in invalid_dirs and not p.name.endswith('_moe')]
-
-    if not dirs_list:
-        print(f"❌ No directories found in {folder}")
-        if args.moe_active:
-            print("   Make sure MOE workloads have been processed (run process_moe_workloads.py)")
-        exit(1)
+        print("   Make sure MOE workloads have been processed (run process_moe_workloads.py)")
+    exit(1)
 
     print(f"Found {len(dirs_list)} directories to process: {[d.name for d in dirs_list]}")
 
@@ -76,15 +74,19 @@ def save_heatmap(file_index = 0, out_put_dir="heatmaps"):
     """
     os.makedirs(out_put_dir, exist_ok=True)
     matrix = get_matrix(file_index)
-    cmap = plt.cm.viridis_r.copy()
+    # Plot in log10 space so the colorbar uses exponent values directly.
+    log_matrix = np.where(matrix > 0, np.log10(matrix), np.nan)
+    # Use a blue->warm scale so low values are blue and high values are warm.
+    cmap = mpl.colormaps['viridis']
     cmap.set_bad(color="white")
     plt.figure(dpi = 300)
-    plt.imshow(np.ma.masked_where(matrix == 0, matrix), cmap=cmap, aspect="auto")
-    plt.colorbar(label="amount of data")
-    plt.title(f"Heatmap of GPU Communication Matrix:\n{os.path.basename(files_list[file_index])}")
-    plt.xlabel("source GPU")
-    plt.ylabel("destination GPU")
-    plt.savefig(f"{out_put_dir}/{os.path.basename(files_list[file_index])}.png", dpi=300, bbox_inches="tight")
+    plt.imshow(np.ma.masked_invalid(log_matrix), cmap=cmap, aspect="auto")
+    plt.colorbar(label="Traffic Volume (log10 of bytes)")
+    plt.title("")
+    plt.xlabel("Destination GPU")
+    plt.ylabel("Source GPU")
+    plt.savefig(f"{out_put_dir}/{os.path.basename(files_list[file_index])}.png", dpi=900, bbox_inches="tight")
+    print(f"Saved heatmap for {os.path.basename(files_list[file_index])} to {out_put_dir}")
     plt.close()
 
 
@@ -485,9 +487,9 @@ if args.moe_active:
                    "only_dp_moe": DP_Runtimes_Table,
                    "matrices_moe": Matrices_Runtimes_Table}
 else:
-    tables_dict = {"only_pp": PP_Runtimes_Table,
-                   "only_tp": TP_Runtimes_Table,
-                   "only_dp": DP_Runtimes_Table,
+    tables_dict = {#"only_pp": PP_Runtimes_Table,
+                #    "only_tp": TP_Runtimes_Table,
+                #    "only_dp": DP_Runtimes_Table,
                    "matrices": Matrices_Runtimes_Table}
 
 def update_Runtimes_Table(table, file_name):
@@ -524,27 +526,31 @@ def Topology_Runtime(topology, matrix, GPUs_num):
     return result
 
 
-if not args.heatmaps_only:
-    for directory in dirs_list:
-        files_list = sorted([f for f in directory.iterdir() if f.is_file() and '.csv' in os.path.basename(f)])
-        for file_index in range(len(files_list)):
-            print (f"martix {file_index} from {len(files_list)} in dir {directory.name}:")
-            print (f"Transport matrix from the file: {os.path.basename(files_list[file_index])}")
-            # save_heatmap(file_index) # heatmaps are already saved in simai.
-            GPUs_num = len(get_matrix(file_index))
-            # N_hbi = get_N_hbi(file_index)
-            N_nodes_1dim = int((GPUs_num/N_hbi)**0.5)+1
-            if N_hbi == None:
-                print ("Error in get_N_hbi: The name of the file is not contaion \"_tp<i>_\"!")
-                continue
+for directory in dirs_list:
+    files_list = sorted([f for f in directory.iterdir() if f.is_file() and '.csv' in os.path.basename(f)])
+    for file_index in range(len(files_list)):
+        if directory.name == "only_tp" or directory.name == "only_dp" or directory.name == "only_pp":
+            continue
+        if "512" not in os.path.basename(files_list[file_index]) or "tp16" not in os.path.basename(files_list[file_index]) or "pp8" not in os.path.basename(files_list[file_index]):
+            continue
+        print (f"martix {file_index} from {len(files_list)} in dir {directory.name}:")
+        print (f"Transport matrix from the file: {os.path.basename(files_list[file_index])}")
+        save_heatmap(file_index) # heatmaps are already saved in simai.
+        GPUs_num = len(get_matrix(file_index))
+        # N_hbi = get_N_hbi(file_index)
+        N_nodes_1dim = int((GPUs_num/N_hbi)**0.5)+1
+        if N_hbi == None:
+            print ("Error in get_N_hbi: The name of the file is not contaion \"_tp<i>_\"!")
+            continue
+        
+        for topology in topologies_dict.keys():
+            topologies_dict[topology].last_runtime = Topology_Runtime(topology, get_matrix(file_index), GPUs_num)
+            print (topology, "runtime is: ", topologies_dict[topology].last_runtime)
             
-            for topology in topologies_dict.keys():
-                topologies_dict[topology].last_runtime = Topology_Runtime(topology, get_matrix(file_index), GPUs_num)
-                print (topology, "runtime is: ", topologies_dict[topology].last_runtime)
-                
-            update_Runtimes_Table(tables_dict[directory.name], os.path.basename(files_list[file_index]))
-            print()
+        update_Runtimes_Table(tables_dict[directory.name], os.path.basename(files_list[file_index]))
+        print()
     #%% arrange the data
+if not args.heatmaps_only:
 
     Runtime_dfs = {name: pd.DataFrame(table) for name, table in tables_dict.items()}
     # total_runtime_df = sum(Runtime_dfs.values())
@@ -769,9 +775,11 @@ for topo_name, matrix in dist_matrices.items():
     df_heatmap = pd.DataFrame(matrix, index=gpu_labels, columns=gpu_labels)
     df_heatmap.to_csv(csv_filename)
     print(f"📄 Saved CSV for {topo_name} → {csv_filename}")    
-
-# Generate hop distribution comparison plot
-plot_hop_distribution(num_gpus=GPUs_num, n_hbi=N_hbi, output_dir=output_dir)
+    
+# Generate hop distribution comparison plot only in full mode.
+# In --heatmaps-only mode, keep outputs strictly to heatmaps.
+if not args.heatmaps_only:
+    plot_hop_distribution(num_gpus=GPUs_num, n_hbi=N_hbi, output_dir=output_dir)
 
 for topo_name, statistic in statistic_dict.items():
     print(topo_name)

@@ -31,6 +31,7 @@ from assign_and_plot import (
     save_effective_heatmap_csv,
     save_effective_heatmap_nonzero_distribution_csv,
     plot_average_cdf_from_csvs,
+    get_graph_switch_and_link_counts,
     plot_average_delay_percentiles_from_dir,
 )
 from topologies.dragonfly_plus import DragonflyPlus
@@ -119,42 +120,60 @@ def create_all_topologies_and_graphs(
     workload_type: str,          # "moe" or "dense"
     root_save_dir: str,          # path to edge_load_comparisons
     switch_ports: int = 128,
-    down_ports: int | None = None,
     router_ports: int = 256,
     endpoints_per_router: int = 8,
     inter_group_variant: str = "medium",
     use_log_x: bool = True,
     include_zeros: bool = True,
+    fat_tree_base_graph: nx.Graph | None = None,
+    hyperx_base_graph: nx.Graph | None = None,
+    dragonfly_plus_base_graph: nx.Graph | None = None,
 ):
     OD = workloads[workload_name]
     n = OD.shape[0]
 
-    base_graphs = {
-        "Fat Tree": FatTree(
+    fat_tree_graph = fat_tree_base_graph
+    if fat_tree_graph is None:
+        fat_tree_graph = FatTree(
             num_nodes=n,
             switch_ports=switch_ports,
             node_size=8,
             link_capacity=1.0,
             link_weight=1.0,
-        ).convert_to_networkx(),
-        "HyperX": HyperX(
+        ).convert_to_networkx()
+
+    hyperx_graph = hyperx_base_graph
+    if hyperx_graph is None:
+        hyperx_graph = HyperX(
             num_nodes=n,
             router_ports=router_ports,
             endpoints_per_router=8,
+            aggregate_tp_groups=False,
             transport_csv_path=workload_name_to_transport_csv_path(workload_name=workload_name),
             link_capacity=1.0,
             link_weight=1.0,
-        ).convert_to_networkx(),
-        "Dragonfly+": DragonflyPlus(
+        ).convert_to_networkx()
+
+    dragonfly_plus_graph = dragonfly_plus_base_graph
+    if dragonfly_plus_graph is None:
+        dragonfly_plus_graph = DragonflyPlus(
             num_nodes=n,
             router_ports=router_ports,
             gpus_per_leaf=8,
             inter_group_variant=inter_group_variant,
             link_capacity=1.0,
-            link_weight=1.0
+            link_weight=1.0,
         ).convert_to_networkx()
 
+    base_graphs = {
+        "Fat Tree": fat_tree_graph,
+        "HyperX": hyperx_graph,
+        "Dragonfly+": dragonfly_plus_graph,
     }
+
+    for graph in base_graphs.values():
+        switch_counts = get_graph_switch_and_link_counts(graph)
+        print(f"Counts for {graph.graph['meta']['topology']}: {switch_counts}")
 
     variants = [
         # ("single_path", False),
@@ -284,6 +303,7 @@ def run_graph_overload_analysis(workload_type: str, should_exit: bool = False):
         connect_points=True,
         save_dir=os.path.join(this_dir, "edge_load_comparisons", workload_type, "equal_spread", "delay_matrices"),
         filename=f"average_delay_percentiles_1024gpus.png",
+        normalize=False,
     )
     if should_exit:
         sys.exit(0)
@@ -299,7 +319,8 @@ def main() -> None:
     ]
 
     for matrices_dir, workload_type in zip(matrices_dirs, workload_types):
-        run_effective_heatmap_analysis(workload_type=workload_type, should_exit=True)
+        run_effective_heatmap_analysis(workload_type=workload_type)
+        run_graph_overload_analysis(workload_type=workload_type, should_exit=True)
         
         print(f"\n=== Loading {workload_type} from {matrices_dir} ===")
         workloads = load_workloads_from_dir(Path(matrices_dir))
@@ -329,16 +350,34 @@ def main() -> None:
                 continue
             
             print(f"Found {len(matching_workloads)} workloads with world_size={world_size}")
-            
+            base_graphs = {
+                "Fat Tree": FatTree(
+                    num_nodes=n,
+                    switch_ports=128,
+                    node_size=8,
+                    link_capacity=1.0,
+                    link_weight=1.0,
+                ).convert_to_networkx(),
+                "Dragonfly+": DragonflyPlus(
+                    num_nodes=n,
+                    router_ports=256,
+                    gpus_per_leaf=8,
+                    inter_group_variant="medium",
+                    link_capacity=1.0,
+                    link_weight=1.0
+                ).convert_to_networkx()
+
+            }
             for chosen in matching_workloads:
                 create_all_topologies_and_graphs(
                     workloads,
                     chosen,
                     workload_type=workload_type,
                     root_save_dir=os.path.join(this_dir, "edge_load_comparisons"),
-                    down_ports=None,
                     endpoints_per_router=8,
                     inter_group_variant="medium",
+                    fat_tree_base_graph=base_graphs["Fat Tree"],
+                    dragonfly_plus_base_graph=base_graphs["Dragonfly+"],
                 )
 
 if __name__ == "__main__":

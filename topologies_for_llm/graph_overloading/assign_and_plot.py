@@ -174,6 +174,93 @@ def get_edge_load_stats(G) -> dict:
     }
 
 
+def get_graph_switch_and_link_counts(
+    G: nx.Graph | nx.DiGraph,
+    *,
+    num_endpoints: int | None = None,
+    verbose: bool = True,
+) -> Dict[str, int]:
+    """
+    Report how many switches and links a topology graph has.
+
+    Switch count is inferred in this priority:
+      1) G.graph["meta"]["counts"]["total_switches"] (if available)
+      2) Topology-specific metadata fields (FatTree/HyperX/etc.)
+      3) total_nodes - num_endpoints (if num_endpoints is provided)
+
+    For DiGraph, both directed edge count and undirected-link count are returned.
+    """
+    total_nodes = int(G.number_of_nodes())
+    directed_edges = int(G.number_of_edges())
+
+    # Count physical links (collapse u->v and v->u in directed graphs).
+    if G.is_directed():
+        undirected_links = len({frozenset((u, v)) for u, v in G.edges() if u != v})
+    else:
+        undirected_links = directed_edges
+
+    meta = G.graph.get("meta", {}) if isinstance(G.graph, dict) else {}
+    counts = meta.get("counts", {}) if isinstance(meta, dict) else {}
+    switch_count: int | None = None
+    rails = spines = superspines = None
+
+    if isinstance(counts, dict) and "total_switches" in counts:
+        switch_count = int(counts["total_switches"])
+    elif isinstance(counts, dict) and {"rails", "spines", "superspines"}.issubset(counts.keys()):
+        rails = int(counts["rails"])
+        spines = int(counts["spines"])
+        superspines = int(counts["superspines"])
+        switch_count = rails + spines + superspines
+    elif isinstance(meta, dict) and isinstance(meta.get("params"), dict) and "routers" in meta["params"]:
+        switch_count = int(meta["params"]["routers"])
+    elif isinstance(meta, dict) and "num_gpus" in meta:
+        switch_count = total_nodes - int(meta["num_gpus"])
+    elif isinstance(meta, dict) and "num_endpoints" in meta:
+        switch_count = total_nodes - int(meta["num_endpoints"])
+    elif num_endpoints is not None:
+        switch_count = total_nodes - int(num_endpoints)
+
+    if switch_count is None:
+        raise ValueError(
+            "Could not infer switch count from graph metadata. "
+            "Pass num_endpoints=<number_of_gpus> to compute switches as total_nodes - num_endpoints."
+        )
+
+    endpoint_count = total_nodes - switch_count
+    result = {
+        "switches": int(switch_count),
+        "endpoints": int(endpoint_count),
+        "links": int(undirected_links),
+        "directed_edges": int(directed_edges),
+        "total_nodes": int(total_nodes),
+    }
+    if rails is not None:
+        result["rails"] = int(rails)
+    if spines is not None:
+        result["spines"] = int(spines)
+    if superspines is not None:
+        result["superspines"] = int(superspines)
+
+    if verbose:
+        if rails is not None:
+            print(
+                f"Switches: {result['switches']} "
+                f"(rails={result['rails']}, spines={result['spines']}, superspines={result['superspines']}), "
+                f"Links: {result['links']} "
+                f"(directed edges: {result['directed_edges']}), "
+                f"Endpoints: {result['endpoints']}, Total nodes: {result['total_nodes']}"
+            )
+        else:
+            print(
+                f"Switches: {result['switches']}, "
+                f"Links: {result['links']} "
+                f"(directed edges: {result['directed_edges']}), "
+                f"Endpoints: {result['endpoints']}, Total nodes: {result['total_nodes']}"
+            )
+
+    return result
+
+
 def annotate_graph_with_loads(G, edge_load, *, capacity=None):
     """
     capacity=None means "infinite" (no overload by util). We store:
@@ -423,7 +510,7 @@ def plot_edge_load_cdf_multiple(
     
     # Keep exact plotted points so saved CSV reproduces the rendered curves.
     plotted_rows = []
-
+    
     for idx, (label, G) in enumerate(graphs_dict.items()):
         loads = np.array([float(d.get("load", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
 
@@ -736,11 +823,13 @@ def plot_average_cdf_from_csvs(
             markevery=markevery,
         )
     
-    plt.ylabel("Edges with load ≤ x (%)", fontsize=16)
-    plt.xlabel("Edge load (bytes in matrix window)", fontsize=16)
+    plt.ylabel("CDF (%)", fontsize=18)
+    plt.xlabel("Edge load (bytes in matrix window)", fontsize=18)
     plt.title(title, fontsize=18)
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.legend(fontsize=13)
+    plt.legend(fontsize=16)
+    plt.xticks(fontsize=16)
+    plt.yticks(fontsize=16)
     
     if use_log_x:
         plt.xscale("log")
@@ -783,6 +872,195 @@ def plot_average_cdf_from_csvs(
     
     pd.DataFrame(csv_rows).to_csv(csv_out_path, index=False)
     print(f"📄 Saved average CDF data CSV: {csv_out_path}")
+
+    # Also save "best topology over time" analysis on a common load axis.
+    # "Time" is represented by load (x-axis): topology with higher CDF% is better.
+    analysis_topos = [t for t in ["Fat Tree", "HyperX", "Dragonfly+"] if t in topo_avg_data]
+    if len(analysis_topos) >= 2:
+        interp_inputs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        grid_values: List[float] = []
+
+        for topo_name in analysis_topos:
+            loads, pcts = topo_avg_data[topo_name]
+            # Keep finite values only
+            valid = np.isfinite(loads) & np.isfinite(pcts)
+            loads = loads[valid]
+            pcts = np.clip(pcts[valid], 0.0, 100.0)
+            if loads.size == 0:
+                continue
+
+            # Ensure monotonicity and collapse duplicate x values.
+            loads = np.maximum.accumulate(loads)
+            pcts = np.maximum.accumulate(pcts)
+            uniq_loads, inv = np.unique(loads, return_inverse=True)
+            uniq_pcts = np.zeros_like(uniq_loads, dtype=float)
+            for i in range(len(uniq_loads)):
+                uniq_pcts[i] = float(np.max(pcts[inv == i]))
+
+            interp_inputs[topo_name] = (uniq_loads, uniq_pcts)
+            grid_values.extend(uniq_loads.tolist())
+
+        if grid_values:
+            common_load_grid = np.array(sorted(set(grid_values)), dtype=float)
+            eps = 1e-9
+            reached_100: set[str] = set()
+            analysis_rows: List[Dict[str, object]] = []
+
+            for load_x in common_load_grid:
+                pct_at_load: Dict[str, float] = {}
+                for topo_name in analysis_topos:
+                    if topo_name not in interp_inputs:
+                        continue
+                    x_arr, y_arr = interp_inputs[topo_name]
+                    if x_arr.size == 1:
+                        pct_val = float(y_arr[0])
+                    else:
+                        pct_val = float(np.interp(load_x, x_arr, y_arr, left=y_arr[0], right=y_arr[-1]))
+                    pct_at_load[topo_name] = float(np.clip(pct_val, 0.0, 100.0))
+
+                if not pct_at_load:
+                    continue
+
+                vals = list(pct_at_load.values())
+                at_100_now = [t for t, v in pct_at_load.items() if v >= 100.0 - eps]
+
+                if all(abs(v) <= eps for v in vals):
+                    # Rule 1: all are zero -> write all.
+                    winners = list(analysis_topos)
+                    rule = "all_zero_write_all"
+                elif at_100_now:
+                    # Rules 3-4: once someone reaches 100, keep first-to-reach set,
+                    # adding any additional topologies when they also reach 100.
+                    reached_100.update(at_100_now)
+                    winners = [t for t in analysis_topos if t in reached_100]
+                    rule = "reached_100_first_to_last"
+                else:
+                    # Rule 2: while nobody reached 100, choose highest percentage.
+                    best_val = max(vals)
+                    winners = [t for t, v in pct_at_load.items() if abs(v - best_val) <= eps]
+                    rule = "highest_below_100"
+
+                row: Dict[str, object] = {
+                    "load": float(load_x),
+                    "best_topology": ";".join(winners),
+                    "rule_applied": rule,
+                }
+                for topo_name in analysis_topos:
+                    row[f"{topo_name}_cdf_percent"] = float(pct_at_load.get(topo_name, np.nan))
+                analysis_rows.append(row)
+
+            if analysis_rows:
+                analysis_out_path = out_path.replace(".png", "_best_topology_over_time.csv")
+                pd.DataFrame(analysis_rows).to_csv(analysis_out_path, index=False)
+                print(f"📄 Saved best-topology-over-time CSV: {analysis_out_path}")
+
+                # Also summarize domination share on a linear load scale.
+                # Weight each stage by its linear interval [load_i, load_{i+1}) and split ties equally.
+                loads_seq = np.array([float(r["load"]) for r in analysis_rows], dtype=float)
+                n_rows = int(loads_seq.size)
+                if n_rows == 1:
+                    # Single stage: assign full unit weight.
+                    stage_weights = np.array([1.0], dtype=float)
+                else:
+                    # Assign each row i the span to the next row.
+                    # Last row has no interval after it, so its weight is 0.
+                    stage_weights = np.zeros(n_rows, dtype=float)
+                    diffs = np.diff(loads_seq)
+                    stage_weights[:-1] = np.maximum(0.0, diffs)
+                    if float(stage_weights.sum()) <= 0.0:
+                        stage_weights = np.ones(n_rows, dtype=float)
+
+                weighted_share = {t: 0.0 for t in analysis_topos}
+                inclusive_share = {t: 0.0 for t in analysis_topos}
+                total_weight = float(stage_weights.sum())
+
+                for i, row in enumerate(analysis_rows):
+                    winners = [w for w in str(row["best_topology"]).split(";") if w]
+                    if not winners:
+                        continue
+                    w = float(stage_weights[i])
+                    split = w / float(len(winners))
+                    for winner in winners:
+                        if winner in weighted_share:
+                            weighted_share[winner] += split
+                            inclusive_share[winner] += w
+
+                dominance_rows: List[Dict[str, object]] = []
+                for topo_name in analysis_topos:
+                    w_raw = float(weighted_share[topo_name])
+                    i_raw = float(inclusive_share[topo_name])
+                    dominance_rows.append(
+                        {
+                            "topology": topo_name,
+                            "dominance_percent_linear_scale": (
+                                100.0 * w_raw / total_weight if total_weight > 0 else 0.0
+                            ),
+                            "dominance_percent_linear_scale_inclusive_ties": (
+                                100.0 * i_raw / total_weight if total_weight > 0 else 0.0
+                            ),
+                            "dominance_weight_raw": w_raw,
+                            "inclusive_weight_raw": i_raw,
+                            "total_weight_raw": total_weight,
+                            "num_stages": n_rows,
+                            "weighting_method": "linear_interval_right_open",
+                        }
+                    )
+
+                dominance_out_path = out_path.replace(".png", "_best_topology_dominance_linear.csv")
+                pd.DataFrame(dominance_rows).to_csv(dominance_out_path, index=False)
+                print(f"📄 Saved best-topology dominance CSV: {dominance_out_path}")
+
+                # Also summarize domination share on experiment-linear scale
+                # (each stage interval contributes equally, independent of load span).
+                exp_weighted_share = {t: 0.0 for t in analysis_topos}
+                exp_inclusive_share = {t: 0.0 for t in analysis_topos}
+                # Right-open intervals [i, i+1): last row has no interval.
+                n_intervals = max(1, n_rows - 1)
+                exp_stage_weights = np.zeros(n_rows, dtype=float)
+                if n_rows == 1:
+                    exp_stage_weights[0] = 1.0
+                else:
+                    exp_stage_weights[:-1] = 1.0
+
+                exp_total_weight = float(exp_stage_weights.sum())
+                for i, row in enumerate(analysis_rows):
+                    winners = [w for w in str(row["best_topology"]).split(";") if w]
+                    if not winners:
+                        continue
+                    w = float(exp_stage_weights[i])
+                    if w <= 0:
+                        continue
+                    split = w / float(len(winners))
+                    for winner in winners:
+                        if winner in exp_weighted_share:
+                            exp_weighted_share[winner] += split
+                            exp_inclusive_share[winner] += w
+
+                exp_rows: List[Dict[str, object]] = []
+                for topo_name in analysis_topos:
+                    w_raw = float(exp_weighted_share[topo_name])
+                    i_raw = float(exp_inclusive_share[topo_name])
+                    exp_rows.append(
+                        {
+                            "topology": topo_name,
+                            "dominance_percent_experiment_linear": (
+                                100.0 * w_raw / exp_total_weight if exp_total_weight > 0 else 0.0
+                            ),
+                            "dominance_percent_experiment_linear_inclusive_ties": (
+                                100.0 * i_raw / exp_total_weight if exp_total_weight > 0 else 0.0
+                            ),
+                            "dominance_weight_raw": w_raw,
+                            "inclusive_weight_raw": i_raw,
+                            "total_weight_raw": exp_total_weight,
+                            "num_stages": n_rows,
+                            "num_intervals": n_intervals,
+                            "weighting_method": "experiment_stage_linear_right_open",
+                        }
+                    )
+
+                exp_out_path = out_path.replace(".png", "_best_topology_dominance_experiment_linear.csv")
+                pd.DataFrame(exp_rows).to_csv(exp_out_path, index=False)
+                print(f"📄 Saved experiment-linear dominance CSV: {exp_out_path}")
 
 
 def plot_edge_load_percentiles_multiple(
@@ -1654,7 +1932,9 @@ def compute_gpu_to_gpu_delay_df(
     include_base_latency_when_zero:
         If True, pairs with S_ij==0 get alpha*hops (otherwise 0).
     save_dir/filename:
-        If save_dir is given, we save the resulting DataFrame to CSV.
+        If save_dir is given, we save the resulting delay DataFrame to CSV.
+        We also save a second transport-aligned delay matrix CSV, where entry (i, j)
+        is 0 when OD(i, j) == 0, and the computed delay otherwise.
     """
 
     if num_endpoints <= 0:
@@ -1781,6 +2061,29 @@ def compute_gpu_to_gpu_delay_df(
     labels = [f"GPU{i}" for i in range(n)]
     df = pd.DataFrame(delay, index=labels, columns=labels)
 
+    # Build a transport-aligned delay matrix:
+    # - 0 when OD(i,j) == 0
+    # - computed delay when OD(i,j) > 0
+    # This remains strictly aligned to the original transport matrix sparsity.
+    delay_transport_aligned = np.zeros((n, n), dtype=np.float64)
+    for s in range(n):
+        row_start = OD_csr.indptr[s]
+        row_end = OD_csr.indptr[s + 1]
+        js = OD_csr.indices[row_start:row_end]
+        ds = OD_csr.data[row_start:row_end]
+        for t_raw, bytes_raw in zip(js, ds):
+            t = int(t_raw)
+            if t < 0 or t >= n:
+                continue
+            if float(bytes_raw) > 0.0:
+                delay_transport_aligned[s, t] = delay[s, t]
+
+    df_transport_aligned = pd.DataFrame(
+        delay_transport_aligned,
+        index=labels,
+        columns=labels,
+    )
+
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         out_name = filename if filename is not None else "gpu_to_gpu_delay.csv"
@@ -1789,6 +2092,11 @@ def compute_gpu_to_gpu_delay_df(
         out_path = os.path.join(save_dir, out_name)
         df.to_csv(out_path)
         print(f"📄 Saved delay DataFrame CSV: {out_path}")
+
+        base_name = out_name[:-4] if out_name.lower().endswith(".csv") else out_name
+        out_path_transport = os.path.join(save_dir, f"{base_name}_transport_aligned.csv")
+        df_transport_aligned.to_csv(out_path_transport)
+        print(f"📄 Saved transport-aligned delay CSV: {out_path_transport}")
 
     return df
 
@@ -2012,18 +2320,20 @@ def plot_average_delay_percentiles_from_dir(
     connect_points: bool = True,
     save_dir: str | None = None,
     filename: str | None = None,
+    normalize: bool = True,
 ) -> None:
     """
-    Generate a percentile plot by averaging normalized delay values across multiple
+    Generate a percentile plot by averaging delay percentile values across multiple
     delay summary CSV files in a directory.
     
     For each CSV:
       1. Extract topology names from each row
-      2. Normalize percentile values by dividing by the max value in that CSV
-      3. Accumulate normalized values per topology
+      2. Optionally normalize percentile values by dividing by the max value
+         in that CSV (when normalize=True)
+      3. Accumulate values per topology
     
-    Then compute the average normalized value for each topology at each percentile
-    and plot the result.
+    Then compute the average value for each topology at each percentile and plot
+    the result.
     
     Args:
         csv_dir: Path to directory containing delay_summary_*.csv files.
@@ -2035,6 +2345,7 @@ def plot_average_delay_percentiles_from_dir(
         connect_points: Whether to connect percentile points with lines.
         save_dir: Directory to save the plot. If None, uses csv_dir.
         filename: Output filename. If None, auto-generated.
+        normalize: Whether to normalize the delay values by the max value in each CSV.
     """
     csv_dir = os.path.expanduser(str(csv_dir))
     if not os.path.isdir(csv_dir):
@@ -2071,8 +2382,8 @@ def plot_average_delay_percentiles_from_dir(
         parts = name.split("_")
         return parts[0].replace("_", " ")
     
-    # Accumulate normalized values per topology
-    # Structure: {topology: {percentile: [list of normalized values]}}
+    # Accumulate values per topology.
+    # Structure: {topology: {percentile: [list of values]}}
     topo_values: Dict[str, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
     all_percentiles = set()
     
@@ -2096,26 +2407,31 @@ def plot_average_delay_percentiles_from_dir(
         percentiles = sorted([int(c[1:]) for c in pct_cols])
         all_percentiles.update(percentiles)
         
-        # Find max value in this CSV for normalization (across all topologies and percentiles)
-        max_val = 0.0
-        for _, row in df.iterrows():
-            for p in percentiles:
-                val = row.get(f"p{p}", 0)
-                if pd.notna(val) and val > max_val:
-                    max_val = val
-        
-        if max_val <= 0:
-            print(f"  ⚠️ Skipping {os.path.basename(csv_path)}: max value is 0")
-            continue
-        
-        # Normalize and accumulate
+        max_val = None
+        if normalize:
+            # Find max value in this CSV for normalization (across all topologies and percentiles)
+            max_val = 0.0
+            for _, row in df.iterrows():
+                for p in percentiles:
+                    val = row.get(f"p{p}", 0)
+                    if pd.notna(val) and val > max_val:
+                        max_val = val
+
+            if max_val <= 0:
+                print(
+                    f"  ⚠️ Skipping {os.path.basename(csv_path)}: "
+                    "max value is 0 (required for normalization)"
+                )
+                continue
+
+        # Accumulate normalized or raw values based on the flag.
         for _, row in df.iterrows():
             topo_name = extract_topology(row["file"])
             for p in percentiles:
                 val = row.get(f"p{p}", 0)
                 if pd.notna(val):
-                    normalized = val / max_val
-                    topo_values[topo_name][p].append(normalized)
+                    value = (val / max_val) if normalize else val
+                    topo_values[topo_name][p].append(value)
     
     if not topo_values:
         raise RuntimeError("No valid data found in any CSV files")
@@ -2136,10 +2452,11 @@ def plot_average_delay_percentiles_from_dir(
     
     # Generate title
     if title is None:
+        title_prefix = "Average Normalized Delay Percentiles" if normalize else "Average Delay Percentiles"
         if num_gpus is not None:
-            title = f"Average Normalized Delay Percentiles ({num_gpus} GPUs, {len(files)} workloads)"
+            title = f"{title_prefix} ({num_gpus} GPUs, {len(files)} workloads)"
         else:
-            title = f"Average Normalized Delay Percentiles ({len(files)} workloads)"
+            title = f"{title_prefix} ({len(files)} workloads)"
     
     # Plot setup
     plt.figure(figsize=(14, 6))
@@ -2183,11 +2500,13 @@ def plot_average_delay_percentiles_from_dir(
             plt.scatter(x_mark, y_mark, color=color, label=topo_name,
                         marker=marker, s=80)
     
-    plt.xlabel("Delay (ms)", fontsize=14)
-    plt.ylabel("Percentile (%)", fontsize=14)
+    plt.xlabel("Delay (ms)", fontsize=18)
+    plt.ylabel("Percentile (%)", fontsize=18)
     plt.title(title, fontsize=16)
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.legend(loc='lower right', fontsize=12)
+    plt.legend(loc='lower right', fontsize=16)
+    plt.xticks(fontsize=16)
+    plt.yticks(fontsize=16)
     
     # Show major ticks every 5% on the percentile axis (even if data has 1% spacing).
     ax = plt.gca()
@@ -2225,3 +2544,5 @@ def plot_average_delay_percentiles_from_dir(
     
     pd.DataFrame(rows).to_csv(csv_out_path, index=False)
     print(f"📄 Saved average delay percentiles CSV: {csv_out_path}")
+
+    

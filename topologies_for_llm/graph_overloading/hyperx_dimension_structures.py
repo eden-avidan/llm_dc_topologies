@@ -56,12 +56,24 @@ def extract_dims_for_hyperx_based_on_parallelism(workload_name: str, num_gpus: i
     dim3 = num_gpus // denom
     return (tp_over_8, pp, dim3)
 
-def megatron_rank_to_hyperx_coords(tp: int, pp: int, dp: int, gpus_per_leaf: int = 8) -> List[Tuple[int, int, int]]:
+def megatron_rank_to_hyperx_coords(
+    tp: int,
+    pp: int,
+    dp: int,
+    gpus_per_leaf: int = 8,
+    aggregate_tp_groups: bool = False,
+) -> List[Tuple[int, int, int]]:
     """
     Returns an array coords[rank] = (tp_switch, pp_idx, dp_idx) where:
       - tp_switch = (tp_idx // gpus_per_leaf)  [which 8-GPU leaf within the TP group]
       - pp_idx    = pipeline stage index
       - dp_idx    = data parallel index
+
+    If aggregate_tp_groups=True, collapse TP dimension to size 1 by mapping every
+    rank within the same TP group (every consecutive `tp` ranks) to the same
+    coordinate in the TP axis:
+      - tp_switch = 0 for all ranks
+      - pp_idx / dp_idx remain unchanged
 
     Assumes the rank layout consistent with the transport-matrix pattern:
         rank = tp_idx + tp * dp_idx + tp * dp * pp_idx
@@ -86,7 +98,7 @@ def megatron_rank_to_hyperx_coords(tp: int, pp: int, dp: int, gpus_per_leaf: int
         dp_idx = (rank // tp) % dp
         pp_idx = rank // (tp * dp)
 
-        tp_switch = tp_idx // gpus_per_leaf
+        tp_switch = 0 if aggregate_tp_groups else (tp_idx // gpus_per_leaf)
         coords.append((tp_switch, pp_idx, dp_idx))
 
     return coords
@@ -287,7 +299,7 @@ def load_csv_metas(
     *,
     world_size: Optional[int] = None,
     tp: Optional[int | List[int]] = None,
-    pp: Optional[int] = None,
+    pp: Optional[int | List[int]] = None,
 ) -> List[CsvMeta]:
     """
     Scan a directory for .csv files, parse metadata from filenames, and filter.
@@ -306,6 +318,16 @@ def load_csv_metas(
         tp_values = [int(x) for x in tp]
         tp_set = set(tp_values) if len(tp_values) > 0 else None
 
+    # Normalize pp filter to a set (None => no filter)
+    pp_set: Optional[set[int]]
+    if pp is None:
+        pp_set = None
+    elif isinstance(pp, int):
+        pp_set = {int(pp)}
+    else:
+        pp_values = [int(x) for x in pp]
+        pp_set = set(pp_values) if len(pp_values) > 0 else None
+
     for fn in os.listdir(directory):
         if not fn.lower().endswith(".csv"):
             continue
@@ -317,7 +339,7 @@ def load_csv_metas(
             continue
         if tp_set is not None and t not in tp_set:
             continue
-        if pp is not None and p != pp:
+        if pp_set is not None and p not in pp_set:
             continue
         full_path = os.path.join(directory, fn)
         metas.append(CsvMeta(full_path, fn, ws, t, p))

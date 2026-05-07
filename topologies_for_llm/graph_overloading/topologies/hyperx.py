@@ -33,6 +33,7 @@ class HyperX(Topology):
         router_ports: int = 64,
         endpoints_per_router: int = 8,
         transport_csv_path: Optional[str] = None,  # <-- new
+        aggregate_tp_groups: bool = False,
         link_capacity: float = 1.0,
         link_weight: float = 1.0,
     ) -> None:
@@ -50,6 +51,7 @@ class HyperX(Topology):
         self.router_ports = int(router_ports)
         self.p = int(endpoints_per_router)  # 8
         self.transport_csv_path = transport_csv_path
+        self.aggregate_tp_groups = bool(aggregate_tp_groups)
         self.link_capacity = float(link_capacity)
         self.link_weight = float(link_weight)
 
@@ -95,15 +97,22 @@ class HyperX(Topology):
             raise ValueError(f"tp={tp} must be divisible by endpoints_per_router={p} (8)")
 
         # dims = (tp_leaf_count, pp, dp)
-        Sx, Sy, Sz = (tp // p, pp, dp)
+        # When aggregating TP groups, collapse TP axis to size 1 so consecutive
+        # HBI groups (8-GPU chunks) under the same TP group share one switch.
+        # This keeps intra-HBI distance=1 via direct GPU mesh, while different
+        # HBI groups under the same switch are distance=2 (gpu -> switch -> gpu).
+        Sx = 1 if self.aggregate_tp_groups else (tp // p)
+        Sy, Sz = pp, dp
         R = int(Sx * Sy * Sz)
 
         # Port check for clique-per-dimension HyperX
         degree_inter = (Sx - 1) + (Sy - 1) + (Sz - 1)
-        if p + degree_inter > P:
+        endpoints_per_router_effective = tp if self.aggregate_tp_groups else p
+        if endpoints_per_router_effective + degree_inter > P:
             raise ValueError(
-                f"Port constraint violated: endpoints_per_router={p} + interconnect_degree={degree_inter} "
-                f"=> {p + degree_inter} > router_ports={P}."
+                f"Port constraint violated: endpoints_per_router={endpoints_per_router_effective} "
+                f"+ interconnect_degree={degree_inter} "
+                f"=> {endpoints_per_router_effective + degree_inter} > router_ports={P}."
             )
 
         router_base = n
@@ -122,7 +131,13 @@ class HyperX(Topology):
             return int(x), int(y), int(z)
 
         # --- GPU rank -> router mapping using Megatron coords ---
-        rank_coords = hds.megatron_rank_to_hyperx_coords(tp=tp, pp=pp, dp=dp, gpus_per_leaf=p)
+        rank_coords = hds.megatron_rank_to_hyperx_coords(
+            tp=tp,
+            pp=pp,
+            dp=dp,
+            gpus_per_leaf=p,
+            aggregate_tp_groups=self.aggregate_tp_groups,
+        )
 
         gpu_to_router = np.empty(n, dtype=np.int32)
         router_id_to_coord: Dict[int, Tuple[int, int, int]] = {}
@@ -172,7 +187,7 @@ class HyperX(Topology):
 
             # vary x
             for nx_ in range(Sx):
-                if nx_ == x: 
+                if nx_ == x:
                     continue
                 dst = router_base + coord_to_idx((nx_, y, z))
                 key = (min(src, dst), max(src, dst))
@@ -208,7 +223,14 @@ class HyperX(Topology):
         meta: Dict[str, Any] = {
             "topology": "HyperX-3D Megatron-driven (tp_leaf, pp, dp)",
             "transport_csv_path": self.transport_csv_path,
-            "megatron": {"world_size": world_size, "tp": tp, "pp": pp, "dp": dp, "gpus_per_leaf": p},
+            "megatron": {
+                "world_size": world_size,
+                "tp": tp,
+                "pp": pp,
+                "dp": dp,
+                "gpus_per_leaf": p,
+                "aggregate_tp_groups": self.aggregate_tp_groups,
+            },
             "params": {"dims": (Sx, Sy, Sz), "routers": R, "router_ports": P},
             "coord_order": "idx=(x*Sy + y)*Sz + z  (z fastest)",
             "coord_maps": {
@@ -232,7 +254,7 @@ class HyperX(Topology):
 
         G = nx.DiGraph()
         total_nodes = res.meta.get("megatron", {}).get("world_size", self.num_nodes) + res.meta["params"]["routers"]
-        G.add_nodes_from(range(total_nodes))
+        G.add_nodes_from(range(total_nodes))    
 
         for idx in order:
             u, v = int(edges[idx, 0]), int(edges[idx, 1])
